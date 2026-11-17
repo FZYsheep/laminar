@@ -40,11 +40,13 @@ experience_buffer:
   # ExperienceBuffer consumes only the training experience-store namespace.
   store_namespace: train
 
-# TODO(async_rl): add critic and ref-policy config support.
+# TODO(async_rl): add critic support.
 
 actor_rollout_ref:
   actor:
     strategy: fsdp2
+    # Build a frozen reference on the trainer pool and add verl's PPO KL loss.
+    use_kl_loss: False
     ppo_micro_batch_size_per_gpu: 1
     # Async PPO objective uses the mainline actor loss; recipes may override
     # clip ratios and loss aggregation.
@@ -53,6 +55,8 @@ actor_rollout_ref:
     clip_ratio_c: 3
     loss_agg_mode: token-mean
     loss_scale_factor: null
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
   rollout:
     name: vllm
     # Rollout pool shape. The number of train rollout replicas is derived as

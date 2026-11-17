@@ -18,6 +18,8 @@
 # All model, algorithm, and resource knobs can be overridden via Hydra CLI
 # arguments passed to this script (e.g. ``training_strategy=colocate_async`` or
 # ``trainer.nnodes=4 actor_rollout_ref.rollout.nnodes=4 relay.num_cpus=4`` for 64x H20).
+# Frozen reference KL: actor_rollout_ref.actor.use_kl_loss=True
+# actor_rollout_ref.actor.kl_loss_coef=0.001 actor_rollout_ref.ref.megatron.param_offload=True
 
 set -euo pipefail
 

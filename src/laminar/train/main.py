@@ -62,6 +62,7 @@ from laminar.train.relay import RelayClient, RelayManager
 from laminar.train.relay.transport import ucx_job_runtime_env_vars_from_env
 from laminar.train.tracker import Tracker, TrackerConfig
 from laminar.train.trainer import AsyncRLTrainer, AsyncRLTrainerConfig
+from laminar.workers.reference import validate_reference_policy_config
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -160,6 +161,7 @@ def _initialize_runtime(config: DictConfig) -> _AsyncRLRuntime:
 
     with simple_timer("config", init_timing_raw):
         colocate = _validate_training_strategy(config)
+        validate_reference_policy_config(config)
         if config.trainer.total_epochs is not None:
             raise ValueError("async_rl classic rollout requires trainer.total_epochs=null; use total_training_steps")
         rollout_cfg: RolloutConfig = omega_conf_to_dataclass(config.actor_rollout_ref.rollout)
@@ -594,6 +596,7 @@ def resolve_train_config(config: DictConfig) -> DictConfig:
     if storage_cfg.get("total_storage_size") is None or int(storage_cfg.total_storage_size) < min_tq_size:
         storage_cfg.total_storage_size = min_tq_size
 
+    validate_reference_policy_config(config)
     return config
 
 

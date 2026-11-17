@@ -342,6 +342,7 @@ def test_async_actor_init_model_keeps_mainline_actor_loss_config(monkeypatch):
 
     worker = object.__new__(AsyncActorWorker)
     worker._is_rollout = False
+    worker._is_ref = False
     worker.config = OmegaConf.create({"actor": {"global_batch_info": None}})
 
     AsyncActorWorker.init_model(worker)
@@ -1084,20 +1085,19 @@ def test_async_trainer_rejects_correction_without_rollout_log_probs():
         )
 
 
-def test_async_trainer_rejects_unsupported_ref_policy_kl():
-    for path in ("algorithm.use_kl_in_reward", "actor_rollout_ref.actor.use_kl_loss"):
-        config = _composed_async_rl_config()
-        OmegaConf.update(config, path, True)
+def test_async_trainer_rejects_kl_in_reward():
+    config = _composed_async_rl_config()
+    config.algorithm.use_kl_in_reward = True
 
-        with pytest.raises(ValueError, match="does not support ref-policy KL"):
-            AsyncRLTrainer(
-                config,
-                resource_pool_manager=None,
-                experience_buffer=None,
-                relay_client=None,
-                tracker=None,
-                trainer_config=AsyncRLTrainerConfig(),
-            )
+    with pytest.raises(ValueError, match="does not support KL in reward"):
+        AsyncRLTrainer(
+            config,
+            resource_pool_manager=None,
+            experience_buffer=None,
+            relay_client=None,
+            tracker=None,
+            trainer_config=AsyncRLTrainerConfig(),
+        )
 
 
 def test_train_batch_metrics_summarize_rewards_advantages():
