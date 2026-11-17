@@ -117,9 +117,6 @@ uv sync --locked --extra megatron --extra vllm --extra ucx --extra swe
 
 Once the environment is ready, see [Recipes](#recipes) to launch training and evaluation experiments.
 
-Async training also supports [reference-policy KL loss](docs/reference-policy.md)
-with `actor_rollout_ref.actor.use_kl_loss=True`.
-
 ## Recipes
 
 - **[SWE](recipes/swe/README.md)**: `Qwen3-Coder-30B-A3B-Instruct` on SWE-rebench and SWE-bench Verified (46.6% → **52.2%** on 64×H800).

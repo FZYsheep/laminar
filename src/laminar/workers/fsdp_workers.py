@@ -62,7 +62,6 @@ from laminar.train.relay.transport import (
 from laminar.utils.concurrency import log_exception_callback
 from laminar.utils.tensor import TensorMeta
 from laminar.workers.metrics import add_optimizer_update_metrics, observe_optimizer_updates
-from laminar.workers.reference import ReferencePolicyMixin
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -131,12 +130,12 @@ def _restore_actor_train_mode(worker) -> dict[str, object]:
     }
 
 
-class AsyncActorWorker(ReferencePolicyMixin, ActorRolloutRefWorker):
+class AsyncActorWorker(ActorRolloutRefWorker):
     """``ActorRolloutRefWorker`` with relay-side weight-send + actor PPO loss.
 
     This subclass is not a rollout worker: ``init_model`` rejects rollout
     roles, and its Relay hooks require an actor engine. The async-RL recipe
-    runs it as ``role="actor"`` or ``"actor_ref"`` while a separate vLLM replica fleet owns
+    runs it as ``role="actor"`` while a separate vLLM replica fleet owns
     rollout.
     """
 
@@ -175,7 +174,6 @@ class AsyncActorWorker(ReferencePolicyMixin, ActorRolloutRefWorker):
         """Build the model and wire the configured PPO loss as the engine loss fn."""
         assert not self._is_rollout, "AsyncActorWorker should not be initialized as a rollout worker"
         super().init_model()
-        self._freeze_reference_policy()
 
         # Reuse the mainline actor loss; async-specific behavior is expressed
         # through actor config fields so DP/global-batch normalization stays

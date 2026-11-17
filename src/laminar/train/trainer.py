@@ -29,14 +29,12 @@ Responsibilities:
        publish new weights through the relay servers.
     6. Per-step metrics route through the centralized :class:`Tracker` actor.
 
-Critic support remains a TODO; reference-policy KL uses the actor worker's
-independent, frozen reference engine.
+Critic support remains a TODO; reference-policy KL uses verl's reference worker.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import shutil
@@ -48,7 +46,7 @@ from typing import TYPE_CHECKING, Any, Sequence, cast
 import numpy as np
 import ray
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from tensordict import NonTensorData, TensorDict
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -66,6 +64,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.profiler.performance import simple_timer
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.workers.engine_workers import ActorRolloutRefWorker
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 from laminar.metrics import Aggregation, MetricSpec, export_flat_metrics, reduce_metric_snapshots
@@ -74,7 +73,6 @@ from laminar.train.experience_buffer.client import ExperienceBufferClient, mater
 from laminar.train.experience_buffer.server import SampledBatch
 from laminar.train.experience_buffer.tags import trajectory_key_facts
 from laminar.train.relay import RelayClient
-from laminar.workers.reference import validate_reference_policy_config
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -263,7 +261,8 @@ class AsyncRLTrainer:
         self.config = config
         if _rollout_correction_enabled(config) and not bool(config.actor_rollout_ref.rollout.calculate_log_probs):
             raise ValueError("decoupled rollout correction requires actor_rollout_ref.rollout.calculate_log_probs=True")
-        validate_reference_policy_config(config)
+        if bool(config.algorithm.use_kl_in_reward):
+            raise ValueError("async_rl does not support KL in reward; use actor.use_kl_loss")
         self.trainer_config = trainer_config
         self.resource_pool_manager = resource_pool_manager
         self.experience_buffer = experience_buffer
@@ -311,7 +310,7 @@ class AsyncRLTrainer:
 
     @property
     def use_reference_policy(self) -> bool:
-        return bool(OmegaConf.select(self.config, "actor_rollout_ref.actor.use_kl_loss", default=False))
+        return bool(self.config.actor_rollout_ref.actor.get("use_kl_loss", False))
 
     @property
     def train_batch_size(self) -> int:
@@ -379,16 +378,22 @@ class AsyncRLTrainer:
             f"Initializing workers; resource pools: {list(self.resource_pool_manager.resource_pool_dict.keys())}"
         )
 
-        # Both engines belong to the actor worker on the existing trainer pool.
+        # Actor and reference workers share the existing trainer pool.
         # TODO(async_rl): add critic support.
         actor_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
         actor_worker_cls = _select_async_actor_worker_cls(actor_strategy)
         actor_cls = RayClassWithInitArgs(
             cls=ray.remote(actor_worker_cls),
             config=self.config.actor_rollout_ref,
-            role="actor_ref" if self.use_reference_policy else "actor",
+            role="actor",
         )
         actor_class_dict = {"actor": actor_cls}
+        if self.use_reference_policy:
+            actor_class_dict["ref"] = RayClassWithInitArgs(
+                cls=ray.remote(ActorRolloutRefWorker),
+                config=self.config.actor_rollout_ref,
+                role="ref",
+            )
 
         worker_dict_cls = create_colocated_worker_cls(class_dict=actor_class_dict)
         wg_kwargs = {}
@@ -404,10 +409,11 @@ class AsyncRLTrainer:
         )
         spawn_wg = self._wg_dict.spawn(prefix_set=actor_class_dict.keys())
         self.actor_wg = spawn_wg["actor"]
+        if self.use_reference_policy:
+            self.ref_wg = spawn_wg["ref"]
+            self.ref_wg.init_model()
         logger.info("%s group spawned for strategy=%s; calling init_model()", actor_worker_cls.__name__, actor_strategy)
         self.actor_wg.init_model()
-        if self.use_reference_policy:
-            self._reference_policy_identity = self.actor_wg.get_reference_policy_identity()
 
     def _connect_relay(self) -> dict[str, TensorMeta]:
         """Connect actor ranks to Relay ingress and initialize actor-derived metadata."""
@@ -644,14 +650,8 @@ class AsyncRLTrainer:
         if actor_error is not None:
             raise actor_error
 
-        if self.use_reference_policy:
-            identity = self.actor_wg.get_reference_policy_identity()
-            if identity != self._reference_policy_identity:
-                raise RuntimeError("reference policy changed since initialization")
-            (checkpoint_dir / "reference_policy.json").write_text(json.dumps(identity) + "\n")
-
         checkpoint_root.mkdir(parents=True, exist_ok=True)
-        # Commit only after actor state, prompt cursor and fixed-ref identity.
+        # Advance the marker only after both actor state and data.pt completed.
         tracker_file = get_checkpoint_tracker_filename(str(checkpoint_root))
         temp_tracker_file = tracker_file + ".tmp"
         with open(temp_tracker_file, "w") as f:
@@ -715,15 +715,6 @@ class AsyncRLTrainer:
                 "incomplete async-RL trainer checkpoint: "
                 f"actor_exists={actor_dir.is_dir()} data_exists={data_path.is_file()} path={checkpoint_dir}"
             )
-
-        reference_path = checkpoint_dir / "reference_policy.json"
-        if self.use_reference_policy:
-            if not reference_path.is_file():
-                raise RuntimeError("KL resume requires checkpoint reference_policy.json")
-            if json.loads(reference_path.read_text()) != self.actor_wg.get_reference_policy_identity():
-                raise RuntimeError("checkpoint reference policy does not match the initialized reference")
-        elif reference_path.exists():
-            raise RuntimeError("reference-policy checkpoint requires actor.use_kl_loss=True")
 
         self.actor_wg.load_checkpoint(
             local_path=str(actor_dir),
@@ -939,31 +930,13 @@ class AsyncRLTrainer:
 
     # TODO(async_rl): add critic support.
 
-    def _compute_ref_log_prob(self, td: TensorDict, metrics: dict[str, Any]) -> None:
+    def _compute_ref_log_prob(self, td: TensorDict) -> None:
         infer_td = td.clone(recurse=False)
         if not infer_td["input_ids"].is_nested:
             infer_td = left_right_2_no_padding(infer_td)
-        tu.assign_non_tensor(
-            infer_td,
-            calculate_entropy=False,
-            calculate_sum_pi_squared=False,
-            compute_loss=False,
-            disable_auto_offload=False,
-        )
-        start = time.perf_counter()
-        output = self.actor_wg.compute_ref_log_prob(infer_td)
-        metrics["timing/ref_log_prob"] = time.perf_counter() - start
-        log_probs = tu.get(output, "log_probs")
-        if log_probs is None:
-            raise RuntimeError("actor_wg.compute_ref_log_prob did not return log_probs")
-        ref_log_prob = no_padding_2_padding(log_probs, infer_td).float()
-        response_mask = td["response_mask"].bool()
-        if ref_log_prob.shape != response_mask.shape:
-            raise RuntimeError("reference log probabilities must match the response window")
-        if not torch.isfinite(ref_log_prob[response_mask]).all():
-            raise RuntimeError("reference log probabilities must be finite on action tokens")
-        # Masked NaNs still poison upstream KL arithmetic (NaN * 0).
-        td["ref_log_prob"] = ref_log_prob.masked_fill(~response_mask, 0.0)
+        tu.assign_non_tensor(infer_td, calculate_entropy=False, compute_loss=False)
+        output = self.ref_wg.compute_ref_log_prob(infer_td)
+        td["ref_log_prob"] = no_padding_2_padding(tu.get(output, "log_probs"), infer_td).float()
 
     # TODO(async_rl): add critic update support.
 
@@ -1039,7 +1012,7 @@ class AsyncRLTrainer:
         """Compute read-only actor inputs without blocking the driver event loop."""
         self._compute_old_log_probs(td, metrics)
         if self.use_reference_policy:
-            self._compute_ref_log_prob(td, metrics)
+            self._compute_ref_log_prob(td)
         self._apply_rollout_correction(td, metrics)
         restore_train_mode = bool(metrics.get("old_log_prob/recomputed", 0.0))
         metrics["old_log_prob/restore_train_mode"] = float(restore_train_mode)

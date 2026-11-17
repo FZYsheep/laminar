@@ -40,7 +40,6 @@ from laminar.train.relay.transport import (
 from laminar.utils.tensor import TensorMeta
 from laminar.workers.fsdp_workers import _restore_actor_train_mode
 from laminar.workers.metrics import add_optimizer_update_metrics, observe_optimizer_updates
-from laminar.workers.reference import ReferencePolicyMixin
 
 # Must precede any Megatron import: Megatron's optional FA4 probe only catches
 # ImportError, so broken optional flash_attn.cute installs need to be hidden first.
@@ -56,7 +55,7 @@ logger = logging.getLogger(__name__)
 _RELAY_CONNECT_TIMEOUT_S = 30.0
 
 
-class AsyncMegatronActorWorker(ReferencePolicyMixin, ActorRolloutRefWorker):
+class AsyncMegatronActorWorker(ActorRolloutRefWorker):
     """Megatron ``ActorRolloutRefWorker`` plus Relay full-weight publish.
 
     Megatron/MBridge exports rollout-loadable full HF/vLLM tensors from one
@@ -89,7 +88,6 @@ class AsyncMegatronActorWorker(ReferencePolicyMixin, ActorRolloutRefWorker):
             torch.cuda.current_blas_handle()
             self._log_cuda_memory("cublas_prewarm_after")
         super().init_model()
-        self._freeze_reference_policy()
         self._prewarm_grad_stats_communicators()
         assert self.loss_fn is not None, "ActorRolloutRefWorker.init_model() did not register a loss function"
 

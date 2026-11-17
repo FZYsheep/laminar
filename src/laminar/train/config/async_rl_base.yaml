@@ -45,8 +45,6 @@ experience_buffer:
 actor_rollout_ref:
   actor:
     strategy: fsdp2
-    # Build a frozen reference on the trainer pool and add verl's PPO KL loss.
-    use_kl_loss: False
     ppo_micro_batch_size_per_gpu: 1
     # Async PPO objective uses the mainline actor loss; recipes may override
     # clip ratios and loss aggregation.
