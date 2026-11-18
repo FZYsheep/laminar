@@ -4,6 +4,7 @@
 import asyncio
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from verl.workers.rollout.replica import TokenOutput
 
@@ -292,6 +293,50 @@ async def test_aborted_segments_continue_and_record_the_version_span() -> None:
     assert output.log_probs == [-0.1, -0.2, -0.3]
     assert output.extra_fields["min_global_steps"] == 3
     assert output.extra_fields["max_global_steps"] == 4
+
+
+@pytest.mark.parametrize("budget, receipt", [(8, True), (3, True), (8, False)])
+@pytest.mark.parametrize("as_numpy", [False, True])
+@pytest.mark.asyncio
+async def test_continuation_retains_every_sampler_head(budget, receipt, as_numpy):
+    outputs = []
+    for index, tokens in enumerate(([], [10, 11], [12])):
+        fields = {
+            "global_steps": index + 3,
+            "response_topk_ids": [[token, token + 100] for token in tokens],
+            "response_topk_log_probs": [[-0.1 * token, -3.0] for token in tokens],
+        }
+        if receipt:
+            fields["response_support_complete"] = [False] * len(tokens)
+        if as_numpy:
+            fields.update({key: np.asarray(value) for key, value in fields.items() if key != "global_steps"})
+        outputs.append(
+            TokenOutput(
+                token_ids=tokens,
+                log_probs=[-0.1] * len(tokens),
+                stop_reason="aborted",
+                extra_fields=fields,
+            )
+        )
+    outputs.append(
+        TokenOutput(
+            token_ids=[],
+            log_probs=[],
+            stop_reason="completed",
+            extra_fields={"response_topk_ids": [], "response_topk_log_probs": []},
+        )
+    )
+    server = _Server(outputs)
+    result = await _client(_Router(server)).generate(
+        session_id="heads",
+        prompt_ids=[1],
+        sampling_params={"max_tokens": budget, "logprobs": True, "topk_log_probs": 2},
+    )
+    assert result.token_ids == [10, 11, 12]
+    assert result.extra_fields["response_topk_ids"] == [[10, 110], [11, 111], [12, 112]]
+    assert result.extra_fields["response_topk_log_probs"] == [[-0.1 * token, -3.0] for token in result.token_ids]
+    assert ("response_support_complete" in result.extra_fields) is receipt
+    assert len(server.calls) == (3 if budget == 3 else 4)
 
 
 @pytest.mark.parametrize("global_steps", [None, 2, 4])
