@@ -70,6 +70,7 @@ class RolloutDispatcherConfig:
     # pauses new batches when every replica's KV is at/above the threshold.
     pressure_admission_mode: str = "off"
     kv_cache_usage_threshold: float = 0.80
+    logical_kv_admission: bool = False
 
 
 class RolloutDispatcher:
@@ -179,6 +180,8 @@ class RolloutDispatcher:
         in-flight session cap.
         """
         mode = str(getattr(self.config, "pressure_admission_mode", "off")).lower()
+        if getattr(self.config, "logical_kv_admission", False):
+            return True
         if mode != "enforce":
             return True
         tracker = getattr(self, "llm_server_state_tracker", None)

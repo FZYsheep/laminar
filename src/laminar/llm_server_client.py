@@ -34,7 +34,8 @@ from omegaconf import DictConfig
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
-from laminar.global_request_router.router import RouterClientWaitConfig, RouteUnavailableError
+from laminar.global_request_router.kv_budget import LogicalKVConfig
+from laminar.global_request_router.router import RouterClientWaitConfig, RouteUnavailable, RouteUnavailableError
 from laminar.multi_version_rollout.lifecycle import is_recoverable_backend_error
 from laminar.utils.concurrency import await_shielded_completion
 
@@ -104,6 +105,23 @@ class LLMServerClient:
         self._router = router
         router_config = getattr(config, "rollout_router", None)
         self._wait = RouterClientWaitConfig.from_value(getattr(router_config, "client_wait", None))
+        self._kv_policy = LogicalKVConfig.from_value(getattr(router_config, "logical_kv", None))
+
+    @property
+    def logical_kv_enabled(self) -> bool:
+        return self._kv_policy.enabled
+
+    async def update_session_budget(self, session_id: str, *, context_tokens: int, state_count: int, revision: int):
+        """Publish owner totals for sessions with multiple independent contexts."""
+        if self._kv_policy.enabled:
+            await self._settle_rpc(
+                self._router.update_session_budget.remote(
+                    session_id=session_id,
+                    context_tokens=context_tokens,
+                    state_count=state_count,
+                    revision=revision,
+                )
+            )
 
     @staticmethod
     async def _settle_rpc(awaitable, deadline: float | None = None):
@@ -160,15 +178,19 @@ class LLMServerClient:
                 raise TimeoutError("Router availability wait expired")
             try:
                 remote = getattr(self._router, method).remote(**kwargs)
-                return await self._settle_rpc(remote, deadline)
+                result = await self._settle_rpc(remote, deadline)
             except RouteUnavailableError as error:
-                if getattr(error, "planned_pause", False):
-                    deadline = pause_deadline
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("Router availability wait expired") from error
-                await asyncio.sleep(min(remaining, random.uniform(interval / 2, interval)))
-                interval = min(self._wait.max_backoff_s, interval * 2)
+                # Legacy callers still use the exception-based Router API.
+                result = RouteUnavailable(str(error), planned_pause=error.planned_pause)
+            if not isinstance(result, RouteUnavailable):
+                return result
+            if result.planned_pause:
+                deadline = pause_deadline
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Router availability wait expired: {result.message}")
+            await asyncio.sleep(min(remaining, random.uniform(interval / 2, interval)))
+            interval = min(self._wait.max_backoff_s, interval * 2)
 
     async def _acquire_lease(
         self,
@@ -178,11 +200,21 @@ class LLMServerClient:
         weight_version: int | None,
         planned_pause: bool,
         caller_deadline: float | None,
+        context_tokens: int | None = None,
     ) -> tuple[str, Any]:
         try:
             return await self._retry_router_call(
-                "acquire_lease",
-                dict(session_id=session_id, lease_id=lease_id, weight_version=weight_version),
+                "try_acquire_lease" if self._kv_policy.enabled else "acquire_lease",
+                dict(
+                    session_id=session_id,
+                    lease_id=lease_id,
+                    weight_version=weight_version,
+                    **(
+                        {"context_tokens": context_tokens}
+                        if self._kv_policy.enabled and context_tokens is not None
+                        else {}
+                    ),
+                ),
                 planned_pause=planned_pause,
                 caller_deadline=caller_deadline,
             )
@@ -194,8 +226,9 @@ class LLMServerClient:
                 raise cleanup_cancellation from error
             raise
 
-    async def _release_lease(self, session_id: str, lease_id: str) -> None:
-        acknowledgement = await self._router.release_lease.remote(session_id=session_id, lease_id=lease_id)
+    async def _release_lease(self, session_id: str, lease_id: str, *, context_tokens: int | None = None) -> None:
+        kwargs = {"context_tokens": context_tokens} if self._kv_policy.enabled and context_tokens is not None else {}
+        acknowledgement = await self._router.release_lease.remote(session_id=session_id, lease_id=lease_id, **kwargs)
         if acknowledgement is not None:
             raise RuntimeError(f"invalid request-lease release acknowledgement: {acknowledgement!r}")
 
@@ -207,6 +240,7 @@ class LLMServerClient:
         weight_version: Any | None = None,
         planned_pause: bool = False,
         remaining_timeout_s: float | None = None,
+        context_tokens: int = 0,
     ) -> Any:
         """Submit an idempotent sticky-route bind and return its completion handle.
 
@@ -221,8 +255,12 @@ class LLMServerClient:
         weight_version = _strict_optional_non_negative_int(weight_version, field_name="weight_version")
         caller_deadline = _caller_deadline(remaining_timeout_s)
         return self._retry_router_call(
-            "bind_route",
-            dict(session_id=session_id, min_weight_version=weight_version),
+            "try_bind_route" if self._kv_policy.enabled else "bind_route",
+            dict(
+                session_id=session_id,
+                min_weight_version=weight_version,
+                **({"context_tokens": context_tokens} if self._kv_policy.enabled else {}),
+            ),
             planned_pause=planned_pause,
             caller_deadline=caller_deadline,
         )
@@ -278,6 +316,7 @@ class LLMServerClient:
         """Generate tokens on the Router-selected server for one sticky session."""
         weight_version = _strict_optional_non_negative_int(weight_version, field_name="weight_version")
         priority = kwargs.pop("priority", 0)
+        budget_managed = kwargs.pop("budget_managed", False)
         rollout = getattr(getattr(self.config, "actor_rollout_ref", None), "rollout", None)
         priority_kwargs = {"priority": priority} if priority != 0 and getattr(rollout, "name", None) == "vllm" else {}
         multimodal_kwargs: dict[str, Any] = {}
@@ -307,6 +346,7 @@ class LLMServerClient:
                 weight_version=weight_version,
                 planned_pause=planned_pause,
                 caller_deadline=caller_deadline,
+                context_tokens=None if budget_managed else len(prompt_ids) + len(generated_ids),
             )
 
             output: TokenOutput | None = None
@@ -331,7 +371,15 @@ class LLMServerClient:
                 backend_error = exc
             finally:
                 _, release_cancellation = await await_shielded_completion(
-                    self._release_lease(session_id, backend_request_id)
+                    self._release_lease(
+                        session_id,
+                        backend_request_id,
+                        context_tokens=(
+                            len(prompt_ids) + len(generated_ids) + len(output.token_ids)
+                            if output is not None and not budget_managed
+                            else None
+                        ),
+                    )
                 )
             if release_cancellation is not None:
                 if backend_error is not None:

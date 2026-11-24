@@ -258,9 +258,20 @@ def _initialize_runtime(config: DictConfig) -> _AsyncRLRuntime:
             )
             llm_server_controllers[server_id] = controller
             if colocate:
-                init_model_refs.append(controller.init_engine.remote(resource_pool=sub_pool, colocate=True))
+                init_model_refs.append(
+                    controller.init_engine.remote(
+                        resource_pool=sub_pool,
+                        colocate=True,
+                        logical_kv=rollout_router_config.logical_kv.enabled,
+                    )
+                )
             else:
-                init_model_refs.append(controller.init_engine.remote(resource_pool=sub_pool))
+                init_model_refs.append(
+                    controller.init_engine.remote(
+                        resource_pool=sub_pool,
+                        logical_kv=rollout_router_config.logical_kv.enabled,
+                    )
+                )
 
         if colocate:
             # The replicas sleep after initialization. Do not allocate the
@@ -303,6 +314,15 @@ def _initialize_runtime(config: DictConfig) -> _AsyncRLRuntime:
         rollout_router: ActorHandle = ray.remote(GlobalRequestRouter).remote(
             servers=dict(zip(llm_server_controllers, server_handles, strict=True)),
             config=rollout_router_config,
+            kv_capacities=dict(
+                zip(
+                    llm_server_controllers,
+                    ray.get([controller.get_kv_capacity.remote() for controller in llm_server_controllers.values()]),
+                    strict=True,
+                )
+            )
+            if rollout_router_config.logical_kv.enabled
+            else None,
         )
         ray.get(
             llm_server_state_tracker.connect.remote(  # type: ignore[attr-defined]

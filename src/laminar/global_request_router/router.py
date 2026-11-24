@@ -28,6 +28,7 @@ from typing import Any
 
 import ray
 
+from laminar.global_request_router.kv_budget import KVCapacity, LogicalKVConfig
 from laminar.global_request_router.runtime import _optional_non_negative_int, _required_fraction, _RuntimeRouting
 from laminar.multi_version_rollout.repack import (
     CommittedAbortSource,
@@ -55,6 +56,14 @@ class RouteUnavailableError(RuntimeError):
 
 class SessionRouteClosedError(RuntimeError):
     """The operation does not belong to a live explicitly bound session."""
+
+
+@dataclass(frozen=True)
+class RouteUnavailable:
+    """Retryable routing state returned across RPC without an actor error log."""
+
+    message: str
+    planned_pause: bool = False
 
 
 def _required_non_negative_int(value: Any, *, field_name: str) -> int:
@@ -121,9 +130,11 @@ class GlobalRequestRouterConfig:
     # ``latest_version`` rebinds before each request lease, so aborted turns
     # resume on the newest version routable at reacquisition time.
     continuation: str = SAME_VERSION
+    logical_kv: LogicalKVConfig | dict[str, Any] = field(default_factory=LogicalKVConfig)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_wait", RouterClientWaitConfig.from_value(self.client_wait))
+        object.__setattr__(self, "logical_kv", LogicalKVConfig.from_value(self.logical_kv))
 
 
 @dataclass(frozen=True)
@@ -150,6 +161,10 @@ class _SessionState:
     session_id: str
     route: _RouteBinding | None = None
     leases: dict[str, str] = field(default_factory=dict)
+    context_tokens: int = 0
+    state_count: int = 1
+    reserved_tokens: int = 0
+    budget_revision: int = -1
 
 
 class GlobalRequestRouter:
@@ -160,6 +175,7 @@ class GlobalRequestRouter:
         servers: dict[str, ray.actor.ActorHandle],
         config: GlobalRequestRouterConfig | None = None,
         monotonic_fn: Callable[[], float] | None = None,
+        kv_capacities: dict[str, KVCapacity] | None = None,
     ):
         router_config = GlobalRequestRouterConfig() if config is None else config
         if not isinstance(router_config, GlobalRequestRouterConfig):
@@ -180,6 +196,10 @@ class GlobalRequestRouter:
             monotonic_fn=monotonic_fn,
         )
         self._planned_pause = False
+        self._kv_policy = router_config.logical_kv
+        self._kv_capacities = dict(kv_capacities or {})
+        if self._kv_policy.enabled and set(self._kv_capacities) != set(servers):
+            raise ValueError("logical KV admission requires startup capacity for every replica")
 
     @property
     def _session_id_to_server(self) -> dict[str, _RouteBinding]:
@@ -215,14 +235,131 @@ class GlobalRequestRouter:
         session_id: str,
         *,
         min_weight_version: Any | None = None,
+        context_tokens: int = 0,
+        state_count: int = 1,
     ) -> int | None:
         """Open a session and bind it according to the configured continuation policy."""
         session_id = _required_non_empty_str(session_id, field_name="session_id")
         minimum = _strict_optional_non_negative_int(min_weight_version, field_name="min_weight_version")
+        if self._kv_policy.enabled and session_id not in self._sessions:
+            context_tokens = _required_non_negative_int(context_tokens, field_name="context_tokens")
+            state_count = _required_non_negative_int(state_count, field_name="state_count")
+            session = _SessionState(
+                session_id,
+                context_tokens=context_tokens,
+                state_count=state_count,
+                reserved_tokens=state_count * self._kv_policy.growth_tokens_per_state,
+            )
+            eligible = self._active_route_servers()
+            eligible = [server_id for server_id, state in eligible.items() if state.weight_version >= (minimum or 0)]
+            if self._latest_version:
+                latest = self._latest_routable_servers(minimum or 0)
+                newest = max(state.weight_version for state in latest.values())
+                eligible = [
+                    server_id for server_id in eligible if self._server_states[server_id].weight_version == newest
+                ]
+            server_id = self._select_budget_server(session, eligible)
+            session.route = _RouteBinding(server_id, self._server_states[server_id].weight_version)
+            self._sessions[session_id] = session
+            return session.route.weight_version if minimum is not None and not self._latest_version else None
         if self._latest_version:
             self._open_latest_route(session_id, minimum)
             return None
         return self._open_exact_route(session_id, minimum)
+
+    def try_bind_route(self, session_id: str, **kwargs) -> int | None | RouteUnavailable:
+        """Bind or return a temporary wait; invalid operations still raise."""
+        try:
+            return self.bind_route(session_id, **kwargs)
+        except RouteUnavailableError as error:
+            return RouteUnavailable(str(error), planned_pause=error.planned_pause)
+
+    def _server_context_totals(self, *, exclude_session: str | None = None):
+        totals = {server_id: [0, 0, 0, 0] for server_id in self._server_states}
+        for session in self._sessions.values():
+            if session.session_id == exclude_session or session.route is None:
+                continue
+            total = totals[session.route.server_id]
+            total[0] += session.context_tokens
+            total[1] += session.state_count
+            total[2] += session.reserved_tokens
+            total[3] += 1
+        return totals
+
+    def _select_budget_server(self, session: _SessionState, eligible: list[str], *, continuation: bool = False) -> str:
+        candidates = []
+        contexts = self._server_context_totals(exclude_session=session.session_id)
+        inflight = self._inflight_counts()
+        for server_id in eligible:
+            capacity = self._kv_capacities[server_id]
+            tokens, states, reserved, count = contexts[server_id]
+            demand = capacity.demand(
+                tokens + session.context_tokens,
+                states + session.state_count,
+                reserved + session.reserved_tokens,
+            )
+            count += 1
+            if continuation or self._kv_policy.fits(demand, count, capacity.capacity_bytes):
+                candidates.append((demand / capacity.capacity_bytes, inflight[server_id], count, server_id))
+        if not candidates:
+            if eligible and all(
+                self._kv_capacities[s].demand(session.context_tokens, session.state_count, session.reserved_tokens)
+                > self._kv_policy.admission_capacity_multiplier * self._kv_capacities[s].capacity_bytes
+                for s in eligible
+            ):
+                raise ValueError("session logical KV demand exceeds every eligible replica's capacity")
+            raise RouteUnavailableError(
+                "No replica has logical KV admission capacity", planned_pause=self._planned_pause
+            )
+        return min(candidates)[-1]
+
+    def update_session_budget(
+        self,
+        session_id: str,
+        *,
+        context_tokens: int,
+        state_count: int,
+        revision: int,
+        reserved_tokens: int | None = None,
+    ) -> None:
+        """Record an owner's absolute context totals; ignore stale revisions."""
+        session = self._live_session(session_id)
+        values = {
+            "context_tokens": context_tokens,
+            "state_count": state_count,
+            "revision": revision,
+            "reserved_tokens": state_count * self._kv_policy.growth_tokens_per_state
+            if reserved_tokens is None
+            else reserved_tokens,
+        }
+        values = {name: _required_non_negative_int(value, field_name=name) for name, value in values.items()}
+        if values["revision"] <= session.budget_revision:
+            return
+        session.context_tokens = values["context_tokens"]
+        session.state_count = values["state_count"]
+        session.reserved_tokens = values["reserved_tokens"]
+        session.budget_revision = values["revision"]
+
+    def get_budget_snapshot(self) -> dict[str, dict[str, Any]]:
+        if not self._kv_policy.enabled:
+            return {}
+        contexts = self._server_context_totals()
+        inflight = self._inflight_counts()
+        return {
+            server_id: {
+                "weight_version": state.weight_version,
+                "lifecycle": state.lifecycle,
+                "logical_kv_bytes": self._kv_capacities[server_id].demand(*contexts[server_id][:3]),
+                "session_count": contexts[server_id][3],
+                "context_tokens": contexts[server_id][0],
+                "state_count": contexts[server_id][1],
+                "reserved_tokens": contexts[server_id][2],
+                "capacity_bytes": self._kv_capacities[server_id].capacity_bytes,
+                "kv_cache_usage": self._runtime.server_state(server_id).kv_cache_usage,
+                "inflight_requests": inflight[server_id],
+            }
+            for server_id, state in self._server_states.items()
+        }
 
     def _open_latest_route(self, session_id: str, minimum: int | None) -> None:
         eligible_servers = self._latest_routable_servers(0 if minimum is None else minimum)
@@ -369,7 +506,11 @@ class GlobalRequestRouter:
             if binding.weight_version == newest_version:
                 return
         else:
-            server_id = self._select_latest_route_server(newest_servers)
+            server_id = (
+                self._select_budget_server(session, newest_servers, continuation=True)
+                if self._kv_policy.enabled and session is not None
+                else self._select_latest_route_server(newest_servers)
+            )
         if session is None:
             if not open_session:
                 raise SessionRouteClosedError(f"session {session_id!r} is not bound")
@@ -409,6 +550,8 @@ class GlobalRequestRouter:
         *,
         lease_id: str,
         weight_version: Any | None = None,
+        context_tokens: int | None = None,
+        state_count: int = 1,
     ) -> tuple[str, ray.actor.ActorHandle]:
         """Atomically commit one idempotent request lease on a live session."""
         session = self._live_session(session_id)
@@ -426,18 +569,34 @@ class GlobalRequestRouter:
             assert binding is not None
         else:
             binding = self._validate_exact_route(session, weight_version)
+        if self._kv_policy.enabled and context_tokens is not None:
+            session.context_tokens = _required_non_negative_int(context_tokens, field_name="context_tokens")
+            session.state_count = _required_non_negative_int(state_count, field_name="state_count")
+            session.reserved_tokens = session.state_count * self._kv_policy.growth_tokens_per_state
+        # Admitted sessions must finish to release their budget. Growth gates new binds and Repack.
         server_id = binding.server_id
         # Leases retain the serving replica even if a later update moves or drops the route.
         session.leases[lease_id] = server_id
         return server_id, self._server_states[server_id].handle
 
-    def release_lease(self, session_id: str, lease_id: str) -> None:
+    def try_acquire_lease(self, session_id: str, **kwargs) -> tuple[str, ray.actor.ActorHandle] | RouteUnavailable:
+        """Acquire or return a temporary wait; preserve request lease ownership."""
+        try:
+            return self.acquire_lease(session_id, **kwargs)
+        except RouteUnavailableError as error:
+            return RouteUnavailable(str(error), planned_pause=error.planned_pause)
+
+    def release_lease(self, session_id: str, lease_id: str, *, context_tokens: int | None = None) -> None:
         """Idempotently release one committed request lease."""
         session_id = _required_non_empty_str(session_id, field_name="session_id")
         lease_id = _required_non_empty_str(lease_id, field_name="lease_id")
+        if context_tokens is not None:
+            context_tokens = _required_non_negative_int(context_tokens, field_name="context_tokens")
         session = self._sessions.get(session_id)
         if session is not None:
-            session.leases.pop(lease_id, None)
+            server_id = session.leases.pop(lease_id, None)
+            if server_id is not None and context_tokens is not None and self._kv_policy.enabled:
+                session.context_tokens = context_tokens
 
     def release_route(
         self,
@@ -652,7 +811,9 @@ class GlobalRequestRouter:
         # Classification shares one synchronous snapshot; route mutations happen below.
         route_counts = Counter(binding.server_id for binding in self._route_bindings()) if repack_enabled else None
         groups = (
-            _plan_repack_groups(
+            self._plan_budget_repack(loadable_version, excluded_servers)
+            if repack_enabled and self._kv_policy.enabled
+            else _plan_repack_groups(
                 (
                     _RepackServerView(
                         server_id=server_id,
@@ -709,6 +870,57 @@ class GlobalRequestRouter:
                 self._server_states[source].lifecycle = UPDATING
 
         return RepackPlanResult(groups=tuple(groups), idle_sources=tuple(idle_sources))
+
+    def _plan_budget_repack(self, loadable_version: int, excluded: frozenset[str]):
+        from laminar.multi_version_rollout.repack import CommittedRepackGroup
+
+        groups = []
+        contexts = self._server_context_totals()
+        inflight = self._inflight_counts()
+        versions: dict[int, list[str]] = {}
+        for server_id, state in self._active_route_servers().items():
+            if server_id not in excluded and state.weight_version < loadable_version:
+                versions.setdefault(state.weight_version, []).append(server_id)
+        for version, servers in sorted(versions.items()):
+            totals = {
+                server_id: (self._kv_capacities[server_id].demand(*contexts[server_id][:3]), contexts[server_id][3])
+                for server_id in servers
+            }
+            waiting = {
+                # Leases cover requests that can reach the destination before the next stats poll.
+                server_id: max(
+                    int(self._runtime.server_state(server_id).num_waiting_requests or 0), inflight[server_id]
+                )
+                for server_id in servers
+            }
+            sources: dict[str, list[str]] = {}
+            for source in sorted(servers, key=lambda s: (totals[s][0], s)):
+                if source not in totals or source in sources or totals[source][1] == 0:
+                    continue
+                candidates = []
+                for destination in totals:
+                    if destination == source:
+                        continue
+                    capacity = self._kv_capacities[destination]
+                    # Recompute source demand in the destination's physical layout.
+                    demand = totals[destination][0] + capacity.demand(*contexts[source][:3])
+                    count = totals[destination][1] + totals[source][1]
+                    backlog = waiting[destination] + waiting[source]
+                    if self._kv_policy.fits(demand, count, capacity.capacity_bytes, repack=True) and (
+                        backlog <= self._kv_policy.repack_max_waiting_requests
+                    ):
+                        candidates.append((demand / capacity.capacity_bytes, destination, demand, count, backlog))
+                if candidates:
+                    _, destination, demand, count, backlog = max(candidates, key=lambda c: (c[0], c[1]))
+                    sources.setdefault(destination, []).append(source)
+                    totals[destination] = demand, count
+                    waiting[destination] = backlog
+                    del totals[source]
+            groups.extend(
+                CommittedRepackGroup(tuple(source_ids), destination, version)
+                for destination, source_ids in sorted(sources.items())
+            )
+        return groups
 
     def _begin_latest_version_updates(
         self,
