@@ -99,6 +99,23 @@ uv run --locked --extra megatron --extra vllm --extra ucx --extra swe \
 
 - **Smoke test:** Run a 4-step check first with `bash recipes/swe/train.sh trainer.total_training_steps=4 trainer.save_freq=4` in a fresh `RAY_DATA_HOME` to verify optimizer steps, Relay weight publication, and checkpoint saving.
 
+## Qwen3.5-4B
+
+[`train_qwen35_4b.sh`](train_qwen35_4b.sh) runs a three-step check on one node:
+four FSDP2 Actor/Ref GPUs and four TP1 vLLM replicas, with GRPO, KL loss and
+per-replica session admission. It requires the reference-policy and session-KV
+PRs until those changes merge.
+
+Use the same data, output and sandbox setup as above, with Qwen3.5-4B weights:
+
+```bash
+export MODEL_PATH=/shared/models/Qwen3.5-4B
+uv run --locked --extra fsdp --extra vllm --extra ucx --extra swe \
+  bash recipes/swe/train_qwen35_4b.sh
+```
+
+Hydra arguments override the defaults, including training steps and GPU counts.
+
 ## Evaluate checkpoints
 
 See [docs/evaluation.md](../../docs/evaluation.md) for the evaluation mechanism, configuration options, and Python Client / CLI details.
