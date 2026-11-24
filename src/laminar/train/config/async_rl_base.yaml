@@ -88,6 +88,7 @@ rollout_dispatcher:
   # Tracker snapshots lag by up to one poll (~1s); slight overshoot is expected.
   pressure_admission_mode: ${rollout_router.dynamic_overload_admission.mode}
   kv_cache_usage_threshold: ${rollout_router.dynamic_overload_admission.kv_cache_usage_threshold}
+  logical_kv_admission: ${rollout_router.logical_kv.enabled}
 
 rollout_router:
   _target_: laminar.global_request_router.GlobalRequestRouterConfig
@@ -110,6 +111,15 @@ rollout_router:
   # rollout on the newest weights available at each lease acquisition, so a
   # continued trajectory can span versions.
   continuation: same_version
+  # Optional alternative to scheduler snapshot admission and Repack planning.
+  logical_kv:
+    enabled: False
+    admission_capacity_multiplier: 1.2
+    repack_capacity_multiplier: 1.0
+    max_sessions_per_replica: 24
+    repack_session_multiplier: 1.5
+    growth_tokens_per_state: 512
+    repack_max_waiting_requests: 32
 
 multi_version_rollout:
   _target_: laminar.multi_version_rollout.MultiVersionRolloutManagerConfig
@@ -124,6 +134,7 @@ multi_version_rollout:
     # their generated tokens at the same weight version. Ignored under
     # rollout_router.continuation=latest_version.
     enable: True
+    # Snapshot thresholds apply only when rollout_router.logical_kv.enabled=False.
     # Repack uses instantaneous backend KV snapshots for same-version Best-Fit.
     # Missing/invalid backend KV stats fail fast and terminate the job;
     # post-repack usage is conservatively projected as source + destination.

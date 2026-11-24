@@ -952,6 +952,14 @@ class AsyncRLvLLMColocateWorkerExtension(vLLMColocateWorkerExtension):
     call ``model.load_weights`` directly — no extra D2D / D2H staging hop.
     """
 
+    def logical_kv_capacity(self: WorkerBase) -> dict:  # type: ignore[misc]
+        """Report physical capacity and model coefficients before rollout can sleep."""
+        from dataclasses import asdict
+
+        from laminar.global_request_router.kv_budget import worker_kv_capacity
+
+        return asdict(worker_kv_capacity(self))
+
     def init_shm_state_dict(self: WorkerBase, state_meta_dict: dict[str, TensorMeta]) -> None:  # type: ignore[misc]
         """Materialize the shared CPU buffer mirroring the relay's full state dict.
 

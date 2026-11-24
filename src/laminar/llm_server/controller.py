@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import ray
 
+from laminar.global_request_router.kv_budget import KVCapacity
 from laminar.global_request_router.router import EMPTY_WEIGHT_VERSION
 from laminar.utils.tensor import TensorMeta
 
@@ -73,6 +74,7 @@ class LLMServerController:
         self._checkpoint_path: str | None = self._extract_model_path(engine)
         self._colocate = False
         self._asleep = False
+        self._kv_capacity: KVCapacity | None = None
 
     @staticmethod
     def _extract_model_path(engine: Any) -> str | None:
@@ -95,7 +97,12 @@ class LLMServerController:
             model_config.local_path = checkpoint_path
 
     async def init_engine(
-        self, resource_pool: RayResourcePool, weight_version: int | None = None, *, colocate: bool = False
+        self,
+        resource_pool: RayResourcePool,
+        weight_version: int | None = None,
+        *,
+        colocate: bool = False,
+        logical_kv: bool = False,
     ) -> None:
         """Heavy init that connects the underlying rollout replica to resources."""
         if weight_version is not None and (type(weight_version) is not int or weight_version < 0):
@@ -108,6 +115,9 @@ class LLMServerController:
         if weight_version is not None:
             await self._engine._server_handle.set_global_steps.remote(weight_version)
             self.weight_version = weight_version
+        if logical_kv:
+            inventory = await self._engine._server_handle.collective_rpc.remote("logical_kv_capacity")
+            self._kv_capacity = KVCapacity.from_workers(inventory)
         if colocate:
             await self.sleep_for_training()
 
@@ -161,6 +171,11 @@ class LLMServerController:
         if self._engine._server_handle is None:
             raise RuntimeError("LLM server must be initialized before exposing its server handle")
         return self._engine._server_handle
+
+    def get_kv_capacity(self) -> KVCapacity:
+        if self._kv_capacity is None:
+            raise RuntimeError("logical KV capacity was not collected during engine initialization")
+        return self._kv_capacity
 
     async def check_health(self) -> None:
         """Check backend health without requiring routing metrics."""

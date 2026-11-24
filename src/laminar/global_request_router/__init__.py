@@ -13,10 +13,12 @@
 # limitations under the License.
 """Public surface for the Laminar GlobalRequestRouter."""
 
+from laminar.global_request_router.kv_budget import KVCapacity, LogicalKVConfig
 from laminar.global_request_router.router import (
     GlobalRequestRouter,
     GlobalRequestRouterConfig,
     RouterClientWaitConfig,
+    RouteUnavailable,
     RouteUnavailableError,
     SessionRouteClosedError,
 )
@@ -24,6 +26,9 @@ from laminar.global_request_router.router import (
 __all__ = [
     "GlobalRequestRouter",
     "GlobalRequestRouterConfig",
+    "KVCapacity",
+    "LogicalKVConfig",
+    "RouteUnavailable",
     "RouteUnavailableError",
     "RouterClientWaitConfig",
     "SessionRouteClosedError",
