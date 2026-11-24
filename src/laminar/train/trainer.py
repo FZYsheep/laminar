@@ -1072,6 +1072,9 @@ class AsyncRLTrainer:
             actor_cfg.ppo_epochs,
         )
         actor_update_start = time.perf_counter()
+        # verl consumes nested batches even when the model forward keeps padding.
+        if not td["input_ids"].is_nested:
+            td = left_right_2_no_padding(td)
         output = self.actor_wg.update_actor(td)
         metrics["timing/actor_wg_update_actor"] = time.perf_counter() - actor_update_start
         metrics.update(_extract_actor_update_metrics(output))

@@ -380,7 +380,7 @@ def test_reference_log_probs_reach_actor_update_only_for_kl(monkeypatch, use_kl_
     trainer._update_actor(td, {})
 
     assert updates[0] is td
-    assert not td["input_ids"].is_nested
+    assert td["input_ids"].is_nested
     assert calls == (["ref"] if use_kl_loss else [])
     if use_kl_loss:
         torch.testing.assert_close(td["ref_log_prob"], torch.tensor([[1.0, 2.0, 0.0], [4.0, 0.0, 0.0]]))
@@ -1279,7 +1279,16 @@ def test_update_actor_records_four_by_32_trajectory_contract():
     )
     trainer.actor_wg = actor_wg
     trainer.global_steps = 1
-    td = TensorDict({"sample_id": torch.arange(128)}, batch_size=[128])
+    td = TensorDict(
+        {
+            "sample_id": torch.arange(128),
+            "input_ids": torch.ones(128, 1, dtype=torch.long),
+            "attention_mask": torch.ones(128, 1, dtype=torch.long),
+            "position_ids": torch.zeros(128, 1, dtype=torch.long),
+            "response_mask": torch.ones(128, 1, dtype=torch.long),
+        },
+        batch_size=[128],
+    )
     metrics = {}
 
     trainer._update_actor(td, metrics)
