@@ -267,8 +267,8 @@ rev = "4a8cf3c6fa99960caf22c582ce6412124995565a"
 
 [tool.uv.sources.uni-agent]
 # TODO: switch back to https://github.com/verl-project/uni-agent.git once upstream PRs are merged.
-git = "https://github.com/tongyx361/uni-agent.git"
-rev = "9f4935f4286e0263d1f974c1efefd1c6128c4e7a"
+git = "https://github.com/FZYsheep/uni-agent.git"
+rev = "c197920dc79b27270d7e9365d62f2a0e86c47c48"
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

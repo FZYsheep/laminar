@@ -1764,7 +1764,7 @@ requires-dist = [
     { name = "trl", marker = "extra == 'fsdp'", specifier = "==0.27.0" },
     { name = "trl", marker = "extra == 'megatron'", specifier = "==0.27.0" },
     { name = "ucxx-cu13", marker = "extra == 'ucx'", specifier = "==0.51.1" },
-    { name = "uni-agent", git = "https://github.com/tongyx361/uni-agent.git?rev=9f4935f4286e0263d1f974c1efefd1c6128c4e7a" },
+    { name = "uni-agent", git = "https://github.com/FZYsheep/uni-agent.git?rev=c197920dc79b27270d7e9365d62f2a0e86c47c48" },
     { name = "uvicorn", marker = "extra == 'fsdp'" },
     { name = "uvicorn", marker = "extra == 'megatron'" },
     { name = "uvicorn", marker = "extra == 'vllm'" },
@@ -4353,7 +4353,7 @@ wheels = [
 [[package]]
 name = "uni-agent"
 version = "0.1.0.dev0"
-source = { git = "https://github.com/tongyx361/uni-agent.git?rev=9f4935f4286e0263d1f974c1efefd1c6128c4e7a#9f4935f4286e0263d1f974c1efefd1c6128c4e7a" }
+source = { git = "https://github.com/FZYsheep/uni-agent.git?rev=c197920dc79b27270d7e9365d62f2a0e86c47c48#c197920dc79b27270d7e9365d62f2a0e86c47c48" }
 
 [[package]]
 name = "unidiff"

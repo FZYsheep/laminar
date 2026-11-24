@@ -61,7 +61,7 @@ from laminar.train.experience_buffer.server import ExperienceBufferServer
 from laminar.train.relay import RelayClient, RelayManager
 from laminar.train.relay.transport import ucx_job_runtime_env_vars_from_env
 from laminar.train.tracker import Tracker, TrackerConfig
-from laminar.train.trainer import AsyncRLTrainer, AsyncRLTrainerConfig
+from laminar.train.trainer import AsyncRLTrainer, AsyncRLTrainerConfig, configure_rollout_correction
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -448,6 +448,7 @@ def resolve_train_config(config: DictConfig) -> DictConfig:
 
     OmegaConf.resolve(config)
     _validate_training_strategy(config)
+    configure_rollout_correction(config)
 
     # Validate task recipe path early when the uni-agent task runner is configured.
     task_config_path = OmegaConf.select(

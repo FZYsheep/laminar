@@ -66,6 +66,128 @@ def _composed_async_rl_config():
     return OmegaConf.merge(ppo_cfg, async_rl_cfg)
 
 
+def _score_centering_config():
+    config = _composed_async_rl_config()
+    config.algorithm.rollout_correction.update(
+        bypass_mode=True,
+        loss_type="reinforce",
+        score_centering=True,
+        rollout_is="token",
+    )
+    config.actor_rollout_ref.rollout.topk_log_probs = 2
+    config.actor_rollout_ref.model.use_remove_padding = True
+    config.actor_rollout_ref.model.use_fused_kernels = False
+    return config
+
+
+@pytest.mark.parametrize("engine", ["dp", "megatron"])
+def test_score_centering_recipe_composes_and_selects_native_bypass(engine):
+    from hydra import compose, initialize_config_module
+    from verl.utils.config import omega_conf_to_dataclass
+
+    with initialize_config_module(config_module="laminar.train.config", version_base=None):
+        overrides = [f"model_engine={engine}"]
+        if engine == "megatron":
+            overrides.append("actor_rollout_ref.actor.strategy=megatron")
+        config = compose(config_name="async_rl_score_centering", overrides=overrides)
+    async_rl_trainer_module.configure_rollout_correction(config)
+    omega_conf_to_dataclass(config.actor_rollout_ref.actor)
+    assert config.actor_rollout_ref.actor.policy_loss.rollout_correction.score_centering
+    assert config.actor_rollout_ref.actor.policy_loss.loss_mode == "bypass_mode"
+    assert config.actor_rollout_ref.rollout.topk_log_probs == 32
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("algorithm.rollout_correction.bypass_mode", False),
+        ("actor_rollout_ref.model.use_remove_padding", False),
+        ("actor_rollout_ref.model.use_fused_kernels", True),
+        ("actor_rollout_ref.actor.fsdp_config.pad_to_length", True),
+        ("actor_rollout_ref.actor.megatron.dynamic_context_parallel", True),
+        ("distillation.enabled", True),
+        ("actor_rollout_ref.rollout.temperature", 0),
+        ("actor_rollout_ref.rollout.topk_log_probs", 0),
+        ("actor_rollout_ref.rollout.custom.agent_framework.use_tree_trajectory_manager", True),
+    ],
+)
+def test_score_centering_rejects_incompatible_config(field, value):
+    config = _score_centering_config()
+    if ".megatron." in field:
+        config.actor_rollout_ref.actor.strategy = "megatron"
+    OmegaConf.update(config, field, value, force_add=True)
+    with pytest.raises(ValueError):
+        async_rl_trainer_module.configure_rollout_correction(config)
+
+
+def test_score_centering_selects_native_loss_and_skips_old_policy_and_decoupled_is():
+    trainer = object.__new__(AsyncRLTrainer)
+    trainer.config = _score_centering_config()
+    async_rl_trainer_module.configure_rollout_correction(trainer.config)
+    policy = trainer.config.actor_rollout_ref.actor.policy_loss
+    assert policy.loss_mode == "bypass_mode"
+    assert policy.rollout_correction.score_centering
+    td = TensorDict({"rollout_log_probs": torch.tensor([[-0.1]])}, batch_size=[1])
+    metrics = {}
+    trainer._compute_old_log_probs(td, metrics)
+    trainer._apply_rollout_correction(td, metrics)
+    assert td["old_log_probs"] is td["rollout_log_probs"]
+    assert metrics["old_log_prob/recomputed"] == 0
+    assert "rollout_is_weights" not in td
+
+
+def test_score_centering_native_loss_rejects_missing_logits_hook():
+    from verl.trainer.ppo.score_centering import score_centering_ppo_loss
+
+    config = _score_centering_config()
+    async_rl_trainer_module.configure_rollout_correction(config)
+    with pytest.raises(RuntimeError, match="logits processor did not run"):
+        score_centering_ppo_loss(config.actor_rollout_ref.actor, model_output={})
+
+
+@pytest.mark.parametrize("second_prompt", [[9, 10], [9, 10, 11]])
+def test_sampler_heads_round_trip_producer_materializer_and_reorder(monkeypatch, second_prompt):
+    from uni_agent.framework.framework import GatewayAgentFramework, _list_of_tq_fields_to_tensordict
+    from uni_agent.gateway.session import Trajectory
+
+    framework = object.__new__(GatewayAgentFramework)
+    framework._rollout_config = OmegaConf.create({"topk_log_probs": 2})
+    framework._processor = None
+    framework._mask_unfinished_episode = False
+    fields = []
+    for index, prompt in enumerate(([1, 2], second_prompt)):
+        trajectory = Trajectory(
+            prompt_ids=prompt,
+            response_ids=[3, 4],
+            response_mask=[1, 0],
+            response_logprobs=[-0.1, 0.0],
+            response_topk_ids=[[20 + index, 30 + index], [0, 1]],
+            response_topk_log_probs=[[-0.1, -3.0], [-0.693, -0.693]],
+            response_support_complete=[bool(index), False],
+        )
+        field, _ = framework._trajectory_to_tq_field_and_tag(
+            trajectory=trajectory,
+            sample_fields={},
+            session_index=index,
+            global_steps=0,
+            uid="group",
+        )
+        fields.append(field)
+    batch = _list_of_tq_fields_to_tensordict(fields)
+    install_fake_tq(monkeypatch, get_many_sync_handler=lambda **_: batch)
+    trainer = object.__new__(AsyncRLTrainer)
+    trainer.config = _score_centering_config()
+    td = trainer._materialize_sampled_batch(SampledBatch(keys=["a", "b"], partition_id="train"), metrics={})
+    assert td["rollout_topk_ids"].shape[-1] == 2
+    for index, (prompt, ids) in enumerate(zip(([1, 2], second_prompt), td["rollout_topk_ids"].unbind(), strict=True)):
+        assert ids[len(prompt) - 1].tolist() == [20 + index, 30 + index]
+    reordered = tu.index_select_tensor_dict(td, [1, 0])
+    assert reordered["rollout_topk_ids"][0][len(second_prompt) - 1].tolist() == [21, 31]
+    assert reordered["rollout_support_complete"][0][len(second_prompt) - 1].item()
+    with pytest.raises(RuntimeError, match="every"):
+        _list_of_tq_fields_to_tensordict([fields[0], {"input_ids": torch.tensor([1])}])
+
+
 def test_colocate_configuration_rejects_unsupported_continuation_and_memory_shape():
     config = _composed_async_rl_config()
     config.training_strategy = "colocate_async"

@@ -47,10 +47,11 @@ from typing import TYPE_CHECKING, Any, Sequence, cast
 import numpy as np
 import ray
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tensordict import NonTensorData, TensorDict
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
+from verl.trainer.config.algorithm import RolloutCorrectionConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.rollout_corr_helper import (
     compute_rollout_correction_and_rejection_mask,
@@ -139,6 +140,38 @@ def _extract_actor_update_metrics(output: Any) -> dict[str, Any]:
 def _rollout_correction_enabled(config: DictConfig) -> bool:
     rollout_corr_config = config.algorithm.rollout_correction
     return rollout_corr_config.rollout_is is not None or rollout_corr_config.rollout_rs is not None
+
+
+def configure_rollout_correction(config: DictConfig) -> None:
+    """Select the native bypass loss before Actor init and validate its sampler/engine contract."""
+    correction = config.algorithm.rollout_correction
+    RolloutCorrectionConfig(**{key: value for key, value in correction.items() if key != "_target_"})
+    if not correction.get("bypass_mode", False):
+        return
+    rollout = config.actor_rollout_ref.rollout
+    if not rollout.calculate_log_probs:
+        raise ValueError("bypass_mode requires rollout.calculate_log_probs=True")
+    actor = config.actor_rollout_ref.actor
+    with open_dict(actor.policy_loss):
+        actor.policy_loss.loss_mode = "bypass_mode"
+        actor.policy_loss.rollout_correction = correction
+    if not correction.get("score_centering", False):
+        return
+    if rollout.name != "vllm" or float(rollout.temperature) <= 0 or int(rollout.get("topk_log_probs", 0) or 0) <= 0:
+        raise ValueError("score centering requires vLLM random sampling and positive topk_log_probs")
+    if not config.actor_rollout_ref.model.use_remove_padding or config.actor_rollout_ref.model.use_fused_kernels:
+        raise ValueError("score centering requires use_remove_padding=True and use_fused_kernels=False")
+    engine = actor.megatron if actor.strategy == "megatron" else actor.fsdp_config
+    if actor.get("pad_to_length", False) or engine.get("pad_to_length", False):
+        raise ValueError("score centering does not support bucket padding")
+    if engine.get("dynamic_context_parallel", False):
+        raise ValueError("score centering does not support Dynamic CP")
+    if OmegaConf.select(config, "distillation.enabled", default=False):
+        raise ValueError("score centering does not support distillation")
+    if OmegaConf.select(
+        config, "actor_rollout_ref.rollout.custom.agent_framework.use_tree_trajectory_manager", default=False
+    ):
+        raise ValueError("score centering requires the linear GatewaySession manager")
 
 
 def _extract_reward_group_metrics(batch: SampledBatch) -> dict[str, float]:
@@ -259,6 +292,7 @@ class AsyncRLTrainer:
         ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
     ):
         self.config = config
+        configure_rollout_correction(config)
         if _rollout_correction_enabled(config) and not bool(config.actor_rollout_ref.rollout.calculate_log_probs):
             raise ValueError("decoupled rollout correction requires actor_rollout_ref.rollout.calculate_log_probs=True")
         if bool(config.algorithm.use_kl_in_reward) or bool(config.actor_rollout_ref.actor.use_kl_loss):
@@ -767,6 +801,11 @@ class AsyncRLTrainer:
             require_routed_experts=require_routed_experts,
             use_remove_padding=bool(self.config.actor_rollout_ref.model.use_remove_padding),
             temperature=float(self.config.actor_rollout_ref.rollout.temperature),
+            score_centering_k=(
+                int(rollout_cfg.topk_log_probs)
+                if OmegaConf.select(self.config, "algorithm.rollout_correction.score_centering", default=False)
+                else 0
+            ),
         )
 
     def _compute_advantages(
@@ -859,6 +898,12 @@ class AsyncRLTrainer:
 
     def _compute_old_log_probs(self, td: TensorDict, metrics: dict[str, Any]) -> None:
         """Recompute the update-start policy log probabilities before training."""
+        if OmegaConf.select(self.config, "algorithm.rollout_correction.bypass_mode", default=False):
+            if "rollout_log_probs" not in td:
+                raise RuntimeError("bypass_mode requires rollout_log_probs")
+            td["old_log_probs"] = td["rollout_log_probs"]
+            metrics.update({"timing/old_log_prob": 0.0, "old_log_prob/recomputed": 0.0})
+            return
         infer_td = td.clone(recurse=False)
         if not infer_td["input_ids"].is_nested:
             infer_td = left_right_2_no_padding(infer_td)
@@ -905,6 +950,8 @@ class AsyncRLTrainer:
 
     def _apply_rollout_correction(self, td: TensorDict, metrics: dict[str, Any]) -> None:
         """Apply baseline decoupled IS/RS after the stable old-policy forward."""
+        if self.config.algorithm.rollout_correction.get("bypass_mode", False):
+            return
         if not _rollout_correction_enabled(self.config):
             return
         if "rollout_log_probs" not in td:
@@ -1055,6 +1102,9 @@ class AsyncRLTrainer:
             seed=actor_cfg.data_loader_seed,
             dataloader_kwargs={"shuffle": bool(actor_cfg.shuffle)},
             compute_loss=True,
+            score_centering=bool(
+                OmegaConf.select(self.config, "algorithm.rollout_correction.score_centering", default=False)
+            ),
         )
         metrics["actor/update/trajectory_batch_size"] = float(trajectory_batch_size)
         metrics["actor/update/trajectory_mini_batch_size"] = float(ppo_mini_batch_size)

@@ -292,6 +292,9 @@ class LLMServerClient:
         # continues on the next acquired server.
         generated_ids: list[int] = []
         generated_log_probs: list[float] = []
+        topk_fields: dict[str, list] = {"response_topk_ids": [], "response_topk_log_probs": []}
+        support_complete: list[bool] | None = []
+        k = int(sampling_params.get("topk_log_probs", 0) or 0)
         segment_versions: list[Any] = []
         request_sampling_params = sampling_params
         recovery_deadline: float | None = None
@@ -358,6 +361,25 @@ class LLMServerClient:
             recovery_deadline = None
             recovery_interval = self._wait.initial_backoff_s
             assert output is not None
+            if k:
+                for name, rows in topk_fields.items():
+                    values = output.extra_fields.get(name, [])
+                    if len(values) != len(output.token_ids) or any(len(row) != k for row in values):
+                        raise RuntimeError(f"backend {name} must have shape [{len(output.token_ids)}, {k}]")
+                    rows.extend(list(row) for row in values)
+                receipt = output.extra_fields.get("response_support_complete")
+                if receipt is not None and hasattr(receipt, "tolist"):
+                    receipt = receipt.tolist()
+                if receipt is not None and (
+                    len(receipt) != len(output.token_ids) or any(type(value) is not bool for value in receipt)
+                ):
+                    raise RuntimeError("backend support receipt must contain one bool per token")
+                if output.token_ids:
+                    support_complete = (
+                        support_complete + list(receipt)
+                        if support_complete is not None and receipt is not None
+                        else None
+                    )
             aborted = output.stop_reason == "aborted"
             # Only segments that produced tokens contribute to the version span.
             if output.token_ids or not aborted:
@@ -393,6 +415,11 @@ class LLMServerClient:
                 output.log_probs = generated_log_probs + list(output.log_probs)
 
         extra_fields = dict(output.extra_fields)
+        if k:
+            extra_fields.update(topk_fields)
+            extra_fields.pop("response_support_complete", None)
+            if support_complete is not None:
+                extra_fields["response_support_complete"] = support_complete
         global_steps = extra_fields.get("global_steps")
         expected_identity: dict[str, Any] = {
             "session_id": session_id,

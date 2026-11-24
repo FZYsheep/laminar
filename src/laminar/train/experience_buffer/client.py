@@ -89,6 +89,7 @@ def materialize_batch(
     require_routed_experts: bool,
     use_remove_padding: bool,
     temperature: float,
+    score_centering_k: int = 0,
 ) -> TensorDict:
     """Fetch TQ tensors for ``batch`` and rebuild a train-ready TensorDict.
 
@@ -106,6 +107,9 @@ def materialize_batch(
     ]
     if require_routed_experts:
         fields.append("routed_experts")
+    topk_fields = ("rollout_topk_ids", "rollout_topk_log_probs", "rollout_support_complete")
+    if score_centering_k:
+        fields.extend(topk_fields)
     assert batch.partition_id, "sampled batch must carry a TransferQueue partition"
     fetch_start = time.perf_counter()
     data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
@@ -150,6 +154,20 @@ def materialize_batch(
             )
 
     position_rows = _producer_position_rows(data, prompt_lengths + response_lengths)
+    topk = {}
+    if score_centering_k:
+        expected_lengths = prompt_lengths + response_lengths
+        for name, dtype in zip(topk_fields, (torch.int32, torch.float32, torch.bool), strict=True):
+            value = data.pop(name, None)
+            if value is None or not value.is_nested or value.dtype != dtype:
+                raise RuntimeError(f"experience store {name} must be a jagged tensor with dtype {dtype}")
+            if not torch.equal(value.offsets().diff(), expected_lengths):
+                raise RuntimeError(f"experience store {name} lengths must match prompt+response")
+            if name != "rollout_support_complete" and value.values().shape[1:] != (score_centering_k,):
+                raise RuntimeError(f"experience store {name} head width must equal {score_centering_k}")
+            topk[name] = value
+        metrics["score_centering/head_coverage"] = 1.0
+        metrics["score_centering/head_payload_bytes"] = float(sum(_tensor_payload_nbytes(v) for v in topk.values()))
 
     routed_experts = data.pop("routed_experts") if "routed_experts" in data else None
     if require_routed_experts and routed_experts is None:
@@ -215,6 +233,7 @@ def materialize_batch(
                 jagged_dim=2,
             )
     td["loss_mask"] = td["response_mask"]
+    td.update(topk)
 
     td["temperature"] = NonTensorData(temperature)
     td["global_token_num"] = NonTensorData(torch.sum(td["attention_mask"], dim=-1).tolist())
