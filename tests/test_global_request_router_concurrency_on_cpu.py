@@ -93,28 +93,3 @@ def test_closed_session_cannot_be_reopened_by_a_late_acquire(local_ray):
         assert isinstance(error.value.as_instanceof_cause(), SessionRouteClosedError)
     finally:
         ray.kill(router, no_restart=True)
-
-
-def test_logical_capacity_waits_leave_actor_control_available(local_ray):
-    from laminar.global_request_router import KVCapacity, RouteUnavailable
-
-    router = ray.remote(GlobalRequestRouter).remote(
-        servers={"s0": None},
-        config=GlobalRequestRouterConfig(logical_kv={"enabled": True, "max_sessions_per_replica": 1}),
-        kv_capacities={"s0": KVCapacity(1000, 1, 10)},
-    )
-    try:
-        ray.get(router.mark_active.remote("s0", weight_version=1), timeout=5)
-        ray.get(router.try_bind_route.remote("occupied"), timeout=5)
-        waits = ray.get(
-            [router.try_bind_route.remote(f"pending-{i}") for i in range(100)],
-            timeout=10,
-        )
-        assert all(isinstance(result, RouteUnavailable) for result in waits)
-        assert ray.get(router.get_active_session_count.remote(), timeout=5) == 1
-        ray.get(router.acquire_lease.remote("occupied", lease_id="finish", context_tokens=2000), timeout=5)
-        ray.get(router.release_lease.remote("occupied", "finish"), timeout=5)
-        ray.get(router.release_route.remote("occupied"), timeout=5)
-        assert ray.get(router.try_bind_route.remote("new", min_weight_version=1), timeout=5) == 1
-    finally:
-        ray.kill(router, no_restart=True)

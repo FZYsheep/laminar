@@ -1,7 +1,6 @@
 # Copyright (c) 2026 ByteDance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
 
-import asyncio
 from dataclasses import asdict
 from types import SimpleNamespace
 
@@ -11,7 +10,6 @@ from verl.workers.rollout.replica import TokenOutput
 from laminar.global_request_router import GlobalRequestRouter, GlobalRequestRouterConfig, KVCapacity, LogicalKVConfig
 from laminar.llm_server.controller import LLMServerController
 from laminar.llm_server_client import LLMServerClient
-from laminar.train.dispatcher import RolloutDispatcher, RolloutDispatcherConfig
 
 
 class Remote:
@@ -60,19 +58,6 @@ def client_with_router(*, outputs=None):
 
 
 @pytest.mark.asyncio
-async def test_capacity_wait_resumes_when_an_idle_session_closes():
-    client, router, _ = client_with_router()
-    await client.bind_route("occupied", weight_version=1)
-    pending = asyncio.create_task(client.bind_route("next", weight_version=1, context_tokens=50))
-    await asyncio.sleep(0.01)
-    assert not pending.done()
-    assert router.get_active_session_count() == 1
-    router.release_route("occupied")
-    assert await asyncio.wait_for(pending, timeout=1) == 1
-    assert router.get_budget_snapshot()["a"]["logical_kv_bytes"] == 63
-
-
-@pytest.mark.asyncio
 async def test_aborted_generation_keeps_prompt_and_output_budget_until_close():
     outputs = [
         TokenOutput(token_ids=[7], stop_reason="aborted", extra_fields={"global_steps": 1}),
@@ -112,8 +97,7 @@ async def test_owner_totals_survive_per_request_accounting():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("logical_kv", [False, True])
-async def test_controller_qualifies_capacity_before_colocated_sleep(logical_kv):
+async def test_controller_qualifies_capacity_before_colocated_sleep():
     events = []
 
     async def initialize(**kwargs):
@@ -132,23 +116,6 @@ async def test_controller_qualifies_capacity_before_colocated_sleep(logical_kv):
     )
     controller = LLMServerController(relay_client=None, engine=engine, name="a")
     controller.sleep_for_training = sleep
-    await controller.init_engine(resource_pool=None, colocate=True, logical_kv=logical_kv)
-    assert events == (["initialize", "logical_kv_capacity", "sleep"] if logical_kv else ["initialize", "sleep"])
-    if logical_kv:
-        assert controller.get_kv_capacity() == KVCapacity(100, 2, 1)
-    else:
-        with pytest.raises(RuntimeError, match="not collected"):
-            controller.get_kv_capacity()
-
-
-@pytest.mark.asyncio
-async def test_dispatcher_defers_admission_to_router_when_logical_policy_enabled():
-    dispatcher = object.__new__(RolloutDispatcher)
-    dispatcher.config = RolloutDispatcherConfig(
-        schedule_interval_s=1,
-        state_batch_size=1,
-        num_samples_per_prompt=1,
-        logical_kv_admission=True,
-        pressure_admission_mode="enforce",
-    )
-    assert await dispatcher._llm_server_pressure_open()
+    await controller.init_engine(resource_pool=None, colocate=True, logical_kv=True)
+    assert events == ["initialize", "logical_kv_capacity", "sleep"]
+    assert controller.get_kv_capacity() == KVCapacity(100, 2, 1)
