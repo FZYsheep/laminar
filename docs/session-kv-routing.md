@@ -35,8 +35,10 @@ logical_kv_bytes =
 Shared prefixes are counted once per live context; the estimate does not subtract
 shared prefix-cache blocks. Sharing can reduce the blocks actually used by these
 contexts, while the preallocated GPU KV pool keeps its size. Conversely, vLLM may
-retain cached prefixes from closed sessions. Logical demand and observed cache
-usage therefore need not match or have a fixed ordering.
+keep evictable cached prefixes in the free queue, so `kv_cache_usage` does not
+count all valid cached KV. Pending I/O and asynchronous scheduling can also retain
+blocks beyond the logical lifetime of a request. Logical demand and observed
+allocator pressure therefore describe different ownership and lifetimes.
 
 vLLM's scheduler-level `KVCacheManager.get_blocks(request_id)` can expose the
 currently held blocks per cache group, while `BlockPool.get_num_free_blocks()`
