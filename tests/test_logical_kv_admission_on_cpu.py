@@ -1,7 +1,6 @@
 # Copyright (c) 2026 ByteDance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -17,12 +16,12 @@ from laminar.global_request_router.router import GlobalRequestRouter, GlobalRequ
 
 
 def router(versions, *, capacity=1000, **policy):
-    policy = {"growth_tokens_per_state": 0, **policy}
     instance = GlobalRequestRouter(
         servers={server: object() for server in versions},
         config=GlobalRequestRouterConfig(
             logical_kv=LogicalKVConfig(
                 enabled=True,
+                growth_tokens_per_state=0,
                 **policy,
             )
         ),
@@ -183,21 +182,20 @@ def test_worker_capacity_deduplicates_storage_and_accounts_for_rank_imbalance():
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
     tensor = torch.empty(100)
+    spec = FullAttentionSpec(block_size=16, num_kv_heads=2, head_size=64, dtype=torch.bfloat16)
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(
             kv_caches=[tensor[:10], {"alias": tensor[20:]}, tensor],
-            get_kv_cache_spec=lambda: {
-                "layer": FullAttentionSpec(block_size=16, num_kv_heads=2, head_size=64, dtype=torch.bfloat16),
-            },
+            get_kv_cache_spec=lambda: {"attention": spec},
         ),
         vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(decode_context_parallel_size=2)),
     )
     capacity = worker_kv_capacity(worker)
     assert capacity.capacity_bytes == tensor.untyped_storage().nbytes()
-    assert capacity.bytes_per_token == worker.model_runner.get_kv_cache_spec()["layer"].page_size_bytes / 32
+    assert capacity.bytes_per_token == spec.page_size_bytes / 32
     workers = [
-        asdict(KVCapacity(1000, 10, 5)),
-        asdict(KVCapacity(100, 2, 1)),
+        {"capacity_bytes": 1000, "bytes_per_token": 10, "bytes_per_state": 5},
+        {"capacity_bytes": 100, "bytes_per_token": 2, "bytes_per_state": 1},
     ]
     assert KVCapacity.from_workers(workers) == KVCapacity(100, 2, 1)
     with pytest.raises(ValueError, match="every worker"):
@@ -212,3 +210,17 @@ def test_logical_policy_is_opt_in_and_requires_complete_capacity():
     assert r.get_budget_snapshot() == {}
     with pytest.raises(ValueError, match="every replica"):
         GlobalRequestRouter(servers={"a": object()}, config=GlobalRequestRouterConfig(logical_kv={"enabled": True}))
+
+
+def test_training_config_retains_default_policy_and_can_enable_logical_admission():
+    from pathlib import Path
+
+    from hydra.utils import instantiate
+    from omegaconf import OmegaConf
+
+    config = OmegaConf.load(Path(__file__).parents[1] / "src/laminar/train/config/async_rl_base.yaml")
+    assert not instantiate(config.rollout_router).logical_kv.enabled
+    assert not config.rollout_dispatcher.logical_kv_admission
+    config.rollout_router.logical_kv.enabled = True
+    assert instantiate(config.rollout_router).logical_kv.max_sessions_per_replica == 24
+    assert config.rollout_dispatcher.logical_kv_admission

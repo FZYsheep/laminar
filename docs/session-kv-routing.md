@@ -38,6 +38,23 @@ contexts, while the preallocated GPU KV pool keeps its size. Conversely, vLLM ma
 retain cached prefixes from closed sessions. Logical demand and observed cache
 usage therefore need not match or have a fixed ordering.
 
+vLLM's scheduler-level `KVCacheManager.get_blocks(request_id)` can expose the
+currently held blocks per cache group, while `BlockPool.get_num_free_blocks()`
+and `get_usage()` describe allocator pressure. These are internal EngineCore
+interfaces, not session-level queries exposed by the OpenAI API or worker
+`collective_rpc`. Exact current block accounting requires excluding null blocks,
+deduplicating shared prefixes and retaining blocks pinned by pending I/O.
+A completed request normally loses its block table even if its owning session
+is still waiting on a tool. Consequently, live block counts cannot replace the
+all-session demand used for Repack.
+
+The affine estimate below preserves the extracted scheduling policy. It includes
+partial-block and recurrent-state reserves but does not reproduce every native
+allocator decision, sliding-window retention bound or hybrid-group padding rule.
+More precise future planning can combine scheduler block observations with
+per-context estimates derived from the destination's effective cache specs;
+position-indexed Mamba `align` tables must not be treated as dense allocations.
+
 The worker coefficients come from vLLM's initialized cache specs and deduplicated
 backing storage, including attention, Mamba cache modes and decode context
 parallelism. Replica capacity uses the most constrained worker ratios so that
