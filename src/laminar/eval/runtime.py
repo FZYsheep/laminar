@@ -140,9 +140,12 @@ def initialize_evaluation_runtime(config: DictConfig) -> EvaluationRuntime:
         initial_load_timings[server_id] = time.perf_counter() - before
     handles = ray.get([controller.get_server_handle.remote() for controller in controllers.values()])
     router_config = omega_conf_to_dataclass(config.rollout_router)
+    from laminar.multi_version_rollout.repack import resolve_repack_policy
+
     router = ray.remote(ValidationRequestRouter).remote(
         servers=dict(zip(controllers, handles, strict=True)),
         config=router_config,
+        repack_policy=resolve_repack_policy(OmegaConf.select(config, "validation.repack.policy")),
     )
     ray.get(
         [

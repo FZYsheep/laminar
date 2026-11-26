@@ -11,6 +11,7 @@ import pytest
 
 from laminar.global_request_router.router import RouteUnavailableError
 from laminar.multi_version_rollout import (
+    BestFitRepackPolicy,
     CommittedAbortSource,
     CommittedRepackGroup,
     MultiVersionRolloutManager,
@@ -154,11 +155,7 @@ def _manager(
 ) -> MultiVersionRolloutManager:
     manager = MultiVersionRolloutManager(
         MultiVersionRolloutManagerConfig(
-            repack=MultiVersionRolloutRepackConfig(
-                enable=repack_enabled,
-                source_max_kv_cache_usage=0.4,
-                destination_max_kv_cache_usage=0.9,
-            ),
+            repack=MultiVersionRolloutRepackConfig(enable=repack_enabled),
             schedule_interval_s=0.01,
         )
     )
@@ -182,7 +179,7 @@ async def _run_scheduled_pass(manager: MultiVersionRolloutManager) -> int:
 @pytest.mark.parametrize("value", [-0.1, 1.1, float("nan")])
 def test_repack_config_rejects_invalid_kv_threshold(field: str, value: float) -> None:
     with pytest.raises(ValueError, match=field):
-        MultiVersionRolloutRepackConfig(**{field: value})
+        BestFitRepackPolicy(**{field: value})
 
 
 @pytest.mark.asyncio
@@ -221,8 +218,6 @@ async def test_scheduled_pass_uses_router_plan_and_begin_and_executes_sources_co
             (),
             {
                 "loadable_version": 2,
-                "source_max_kv_cache_usage": 0.4,
-                "destination_max_kv_cache_usage": 0.9,
                 "excluded_servers": [],
                 "repack_enabled": True,
             },

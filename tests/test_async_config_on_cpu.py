@@ -1318,8 +1318,11 @@ def _rollout_dispatcher_config(
         "repack": {
             "_target_": "laminar.multi_version_rollout.MultiVersionRolloutRepackConfig",
             "enable": True,
-            "source_max_kv_cache_usage": 0.5,
-            "destination_max_kv_cache_usage": 0.95,
+            "policy": {
+                "_target_": "laminar.multi_version_rollout.BestFitRepackPolicy",
+                "source_max_kv_cache_usage": 0.5,
+                "destination_max_kv_cache_usage": 0.95,
+            },
         },
     }
     if multi_version_rollout_overrides:
@@ -1909,8 +1912,8 @@ def test_runtime_multi_version_manager_config_from_existing_hydra_tree():
     multi_version_cfg = omega_conf_to_dataclass(config.multi_version_rollout)
 
     assert multi_version_cfg.repack.enable is True
-    assert multi_version_cfg.repack.source_max_kv_cache_usage == 0.5
-    assert multi_version_cfg.repack.destination_max_kv_cache_usage == 0.95
+    assert multi_version_cfg.repack.policy.source_max_kv_cache_usage == 0.5
+    assert multi_version_cfg.repack.policy.destination_max_kv_cache_usage == 0.95
     assert multi_version_cfg.schedule_interval_s == 2.5
 
 
@@ -1933,7 +1936,16 @@ def test_runtime_repack_config_can_disable_repack_only():
     ],
 )
 def test_runtime_repack_config_rejects_invalid_kv_snapshot_threshold(field: str, value: float):
-    config = _rollout_dispatcher_config(multi_version_rollout_overrides={"repack": {field: value}})
+    config = _rollout_dispatcher_config(
+        multi_version_rollout_overrides={
+            "repack": {
+                "policy": {
+                    "_target_": "laminar.multi_version_rollout.BestFitRepackPolicy",
+                    field: value,
+                }
+            }
+        }
+    )
     with pytest.raises(InstantiationException, match=field):
         omega_conf_to_dataclass(config.multi_version_rollout)
 

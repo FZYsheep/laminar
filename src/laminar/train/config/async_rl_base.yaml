@@ -124,11 +124,13 @@ multi_version_rollout:
     # their generated tokens at the same weight version. Ignored under
     # rollout_router.continuation=latest_version.
     enable: True
-    # Repack uses instantaneous backend KV snapshots for same-version Best-Fit.
-    # Missing/invalid backend KV stats fail fast and terminate the job;
-    # post-repack usage is conservatively projected as source + destination.
-    source_max_kv_cache_usage: 0.5
-    destination_max_kv_cache_usage: 0.95
+    # Repack strategy (_target_ mapping). Default Best-Fit Decreasing uses
+    # instantaneous backend KV snapshots (missing/invalid stats fail fast) and
+    # conservatively projects post-repack usage as source + destination.
+    policy:
+      _target_: laminar.multi_version_rollout.BestFitRepackPolicy
+      source_max_kv_cache_usage: 0.5
+      destination_max_kv_cache_usage: 0.95
 
 relay:
   # Transport backend for Relay weight sync: "ucx" (default) or "nccl".

@@ -20,7 +20,7 @@ Laminar scales RL post-training to large clusters through a decoupled, asynchron
 - **Trajectory-Level Asynchrony**: Generates and consumes individual trajectories independently at their own pace.
   - **Version-mixed partial rollout**: Interrupts in-flight generations on weight sync and continues with newer weights (see paper [Figure 3(d)](https://doi.org/10.1145/3767295.3803580)).
   - **Version-consistent rollout**: Keeps each trajectory on a single model version without mid-trajectory re-prefill (see paper [Figure 3(e)](https://doi.org/10.1145/3767295.3803580)).
-  - **Dynamic repack**: Monitors replica KV-cache utilization and consolidates remaining long-tail trajectories onto fewer replicas within the same version group, freeing drained replicas to pull the latest weights immediately (see paper [Figure 8](https://doi.org/10.1145/3767295.3803580)).
+  - **Dynamic repack**: Monitors replica KV-cache utilization and consolidates remaining long-tail trajectories onto fewer replicas within the same version group, freeing drained replicas to pull the latest weights immediately (see paper [Figure 8](https://doi.org/10.1145/3767295.3803580) and [docs/repack.md](docs/repack.md)).
   - **Concurrent multi-checkpoint evaluation (`laminar.eval`)**: Applies version-pinned routing and tail repacking across checkpoints for bubble-free offline batch and online streaming evaluation (see [docs/evaluation.md](docs/evaluation.md)).
 - **Fault-Tolerant Execution**: Prevents single-replica failures from stalling cluster-wide progress.
   - **Inference engines**: Recover failed replicas from `Relay` (training) or checkpoint storage (evaluation) while preserving in-flight trajectory prefixes.

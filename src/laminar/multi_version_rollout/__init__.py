@@ -24,9 +24,13 @@ destination, and aborted turns continue on the newest weights.
 from typing import TYPE_CHECKING, Any
 
 from laminar.multi_version_rollout.repack import (
+    BestFitRepackPolicy,
     CommittedAbortSource,
     CommittedRepackGroup,
     RepackPlanResult,
+    RepackPolicy,
+    RepackReplica,
+    RepackSession,
 )
 
 if TYPE_CHECKING:
@@ -48,10 +52,14 @@ def __getattr__(name: str) -> Any:
 
 
 __all__ = [
+    "BestFitRepackPolicy",
     "CommittedAbortSource",
     "CommittedRepackGroup",
     "MultiVersionRolloutManager",
     "MultiVersionRolloutManagerConfig",
     "MultiVersionRolloutRepackConfig",
     "RepackPlanResult",
+    "RepackPolicy",
+    "RepackReplica",
+    "RepackSession",
 ]

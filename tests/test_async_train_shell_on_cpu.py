@@ -126,8 +126,8 @@ def test_train_config_maps_nondefault_algorithm_repack_and_rollout_shape():
     config = _compose_train(
         "algorithm.norm_adv_by_std_in_grpo=True",
         "rollout_dispatcher.schedule_interval_s=4.25",
-        "multi_version_rollout.repack.source_max_kv_cache_usage=0.31",
-        "multi_version_rollout.repack.destination_max_kv_cache_usage=0.87",
+        "multi_version_rollout.repack.policy.source_max_kv_cache_usage=0.31",
+        "multi_version_rollout.repack.policy.destination_max_kv_cache_usage=0.87",
         "actor_rollout_ref.actor.loss_agg_mode=token-sum",
         "actor_rollout_ref.actor.loss_scale_factor=17.5",
         "actor_rollout_ref.actor.policy_loss.kl_cov_ratio=0.123",
@@ -143,8 +143,8 @@ def test_train_config_maps_nondefault_algorithm_repack_and_rollout_shape():
     expected = {
         "algorithm.norm_adv_by_std_in_grpo": True,
         "rollout_dispatcher.schedule_interval_s": 4.25,
-        "multi_version_rollout.repack.source_max_kv_cache_usage": 0.31,
-        "multi_version_rollout.repack.destination_max_kv_cache_usage": 0.87,
+        "multi_version_rollout.repack.policy.source_max_kv_cache_usage": 0.31,
+        "multi_version_rollout.repack.policy.destination_max_kv_cache_usage": 0.87,
         "actor_rollout_ref.actor.loss_agg_mode": "token-sum",
         "actor_rollout_ref.actor.loss_scale_factor": 17.5,
         "actor_rollout_ref.actor.policy_loss.kl_cov_ratio": 0.123,

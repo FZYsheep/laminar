@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
@@ -31,9 +30,12 @@ from laminar.multi_version_rollout.lifecycle import (
     wait_for_source_drain,
 )
 from laminar.multi_version_rollout.repack import (
+    BestFitRepackPolicy,
     CommittedAbortSource,
     CommittedRepackGroup,
     RepackPlanResult,
+    RepackPolicy,
+    resolve_repack_policy,
 )
 from laminar.train.relay import EMPTY_VERSION, RelayClient
 from laminar.utils.concurrency import gather_cancel_on_error, log_exception_callback
@@ -92,16 +94,10 @@ class MultiVersionRolloutRepackConfig:
     """Typed config for request migration between same-version rollout engines."""
 
     enable: bool = True
-    source_max_kv_cache_usage: float = 0.5
-    destination_max_kv_cache_usage: float = 0.95
+    policy: RepackPolicy | dict[str, Any] | None = field(default_factory=BestFitRepackPolicy)
 
     def __post_init__(self) -> None:
-        for name, value in (
-            ("source_max_kv_cache_usage", self.source_max_kv_cache_usage),
-            ("destination_max_kv_cache_usage", self.destination_max_kv_cache_usage),
-        ):
-            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-                raise ValueError(f"multi_version_rollout.repack.{name} must be in [0, 1], got {value}")
+        object.__setattr__(self, "policy", resolve_repack_policy(self.policy))
 
 
 @dataclass(frozen=True)
@@ -375,8 +371,6 @@ class MultiVersionRolloutManager:
         try:
             plan: RepackPlanResult = await self.router.plan_and_begin_repack.remote(
                 loadable_version=loadable_version,
-                source_max_kv_cache_usage=self.config.repack.source_max_kv_cache_usage,
-                destination_max_kv_cache_usage=self.config.repack.destination_max_kv_cache_usage,
                 excluded_servers=sorted(excluded_servers),
                 repack_enabled=self.config.repack.enable,
             )

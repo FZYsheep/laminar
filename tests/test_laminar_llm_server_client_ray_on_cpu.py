@@ -66,7 +66,8 @@ class _ControlledRouter:
         self.leases = set()
         self.release_count = 0
 
-    async def acquire_lease(self, session_id, lease_id, weight_version=None):
+    async def acquire_lease(self, session_id, lease_id, weight_version=None, context_tokens=None):
+        del context_tokens
         self.acquire_started.set()
         await self.acquire_allowed.wait()
         self.leases.add((session_id, lease_id))
@@ -74,7 +75,8 @@ class _ControlledRouter:
         await self.reply_allowed.wait()
         return "server-0", self.server
 
-    async def release_lease(self, session_id, lease_id):
+    async def release_lease(self, session_id, lease_id, context_tokens=None):
+        del context_tokens
         self.release_started.set()
         await self.release_allowed.wait()
         self.leases.discard((session_id, lease_id))

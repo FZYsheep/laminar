@@ -107,8 +107,10 @@ async def test_generate_uses_one_committed_lease_and_releases_it() -> None:
         sampling_params={"temperature": 0.0},
     )
     lease_id = server.calls[0]["request_id"]
-    assert router.acquire_calls == [{"session_id": "session", "lease_id": lease_id, "weight_version": 3}]
-    assert router.release_calls == [{"session_id": "session", "lease_id": lease_id}]
+    assert router.acquire_calls == [
+        {"session_id": "session", "lease_id": lease_id, "weight_version": 3, "context_tokens": 2}
+    ]
+    assert router.release_calls == [{"session_id": "session", "lease_id": lease_id, "context_tokens": 4}]
     assert server.calls[0]["session_id"] == "session"
     assert output.extra_fields == {
         "global_steps": 3,
