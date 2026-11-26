@@ -101,9 +101,17 @@ uv run --locked --extra megatron --extra vllm --extra ucx --extra swe \
 
 ## Qwen3.5-4B
 
+The [Run 9 configuration and results](qwen35_4b_run9.md) document Trial
+450162305: 32 Megatron Actor/Ref GPUs and 48 TP1 vLLM GPUs on A100, training
+reward and `rollout_corr/k3_kl` for steps 1–160, and validation of all 16
+checkpoints at steps 10–160.
+[`train_qwen35_4b_run9.sh`](train_qwen35_4b_run9.sh) provides the corresponding
+public training recipe with explicit Ref configuration. It depends on
+[PR #1: reference-policy KL loss](https://github.com/verl-project/laminar/pull/1).
+
 [`train_qwen35_4b.sh`](train_qwen35_4b.sh) runs a three-step check on one node:
 four FSDP2 Actor/Ref GPUs and four TP1 vLLM replicas, with GRPO and KL loss.
-It requires the reference-policy PR until that change merges.
+It also requires PR #1 until that change merges.
 
 Use the same data, output and sandbox setup as above, with Qwen3.5-4B weights:
 
