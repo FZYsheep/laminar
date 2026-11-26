@@ -2,14 +2,14 @@
 # Copyright (c) 2026 ByteDance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
 
-# Qwen3.5-4B SWE, Trial 450162305 Run 9: 32 Megatron Actor/Ref + 48 vLLM GPUs.
+# Qwen3.5-4B SWE: 32 Megatron Actor/Ref + 48 vLLM GPUs.
 # Requires the reference-policy support in verl-project/laminar#1.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export MODEL_ID=${MODEL_ID:-Qwen3.5-4B}
 export MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME:-${HOME}/verl}/models/Qwen3.5-4B"}
-export EXP_NAME=${EXP_NAME:-qwen35-4b-swe-run9}
+export EXP_NAME=${EXP_NAME:-qwen35-4b-swe}
 export TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL=0
 export LAMINAR_RAY_ENV_VARS="$(
     python3 -c 'import json, os; env = json.loads(os.environ.get("LAMINAR_RAY_ENV_VARS", "{}")); env["TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"] = "0"; print(json.dumps(env))'

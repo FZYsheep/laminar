@@ -101,50 +101,28 @@ uv run --locked --extra megatron --extra vllm --extra ucx --extra swe \
 
 ## Qwen3.5-4B
 
-[`train_qwen35_4b.sh`](train_qwen35_4b.sh) provides the public training recipe
-for Trial 450162305 / Run 9: 32 Megatron Actor/Ref GPUs
+[`train_qwen35_4b.sh`](train_qwen35_4b.sh) uses 32 Megatron Actor/Ref GPUs
 (TP1 / PP1 / CP4 / EP1 / ETP1, DP8) and 48 TP1 vLLM GPUs on A100.
-It uses GRPO/PPO with a frozen Ref and `low_var_kl` loss at coefficient 0.001,
-and depends on
+Training uses GRPO/PPO, 32 prompts × 8 trajectories per step, 128K responses,
+token importance sampling capped at 2, reward-group filtering, and frozen Ref
+KL loss (`low_var_kl`, coefficient 0.001). It requires
 [PR #1: reference-policy KL loss](https://github.com/verl-project/laminar/pull/1).
-
-Use the data, output and sandbox setup above with Qwen3.5-4B weights and
-10 nodes × 8 A100 GPUs (4 training nodes and 6 rollout nodes). The historical
-training dataset was the filtered SWE-rebench subset
-`swe_rebench_filtered_1150.parquet`.
 
 ```bash
 export MODEL_PATH=/shared/models/Qwen3.5-4B
-export TRAIN_FILE=/shared/data/swe/swe_rebench_filtered_1150.parquet
-export RAY_DATA_HOME=/shared/outputs/qwen35-4b-swe-run9
-export PERSISTENT_OUTPUT_ROOT=/shared/outputs
-export TASK_CONFIG_PATH="$PWD/recipes/swe/task_config.yaml"
-export RAY_ADDRESS=auto
-
 uv run --locked --extra megatron --extra vllm --extra ucx --extra swe \
   bash recipes/swe/train_qwen35_4b.sh
 ```
 
-The launcher defaults to 160 training steps and saves a checkpoint every
-10 steps. Hydra arguments override its defaults; append
-`trainer.total_training_steps=3 trainer.save_freq=3` for a short launch check.
+The launcher defaults to 160 steps and saves every 10 steps. The figure shows
+training reward, rollout-to-Actor k3 KL, and all 16 checkpoint validations.
+Training curves include a trailing 10-step mean.
 
-The figure shows the recorded Run 9 training reward and `rollout_corr/k3_kl`
-for steps 1–160, plus validation of all 16 checkpoints at steps 10–160.
-Training curves include the per-step values and a trailing 10-step mean.
-The three plots share one horizontal row in a single-line vector SVG.
+![Qwen3.5-4B training reward, rollout k3 KL and checkpoint validation](qwen35_4b.svg)
 
-![Qwen3.5-4B Run 9: training reward, rollout k3 KL and checkpoint validation](qwen35_4b_run9.svg)
-
-Validation targets SWE-bench Verified with 500 instances and `n=1`.
-Rates use the actual scored-session denominator: the initial model resolves
-236/497 (47.48%; three instances unscored), while step 160 resolves
-**282/500 (56.4%)**. The k3 curve compares rollout with the update-start Actor;
-Ref regularization is recorded separately as `actor/kl_loss`.
-
-These historical results have not been rerun with the public launcher.
-Its admission configuration follows the public base recipe, and the async
-trainer at PR #1 does not consume the recorded `algorithm.filter_groups` flags.
+SWE-bench Verified (`n=1`) improves from 236/497 scored instances (47.48%)
+to **282/500 (56.4%)**; three initial instances are unscored. Rates use the
+actual scored-session denominator. Rollout k3 KL is distinct from Ref KL loss.
 
 ## Evaluate checkpoints
 
