@@ -57,6 +57,14 @@ class SessionRouteClosedError(RuntimeError):
     """The operation does not belong to a live explicitly bound session."""
 
 
+@dataclass(frozen=True)
+class RouteUnavailable:
+    """Retryable routing state returned across RPC without an actor error log."""
+
+    message: str
+    planned_pause: bool = False
+
+
 def _required_non_negative_int(value: Any, *, field_name: str) -> int:
     parsed = _optional_non_negative_int(value, field_name=field_name)
     if parsed is None:
@@ -110,12 +118,53 @@ class RouterClientWaitConfig:
 
 
 @dataclass(frozen=True)
+class ReplicaConcurrencyConfig:
+    """Hard per-replica session and in-flight request caps owned by the Router."""
+
+    max_sessions: int | None = None
+    repack_max_sessions: int | None = None
+    max_inflight_requests: int | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("max_sessions", "repack_max_sessions", "max_inflight_requests"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"replica_concurrency.{field_name} must be a positive integer or None, got {value!r}")
+
+    @property
+    def enabled(self) -> bool:
+        return (
+            self.max_sessions is not None
+            or self.repack_max_sessions is not None
+            or self.max_inflight_requests is not None
+        )
+
+    @property
+    def effective_repack_max_sessions(self) -> int | None:
+        return self.repack_max_sessions if self.repack_max_sessions is not None else self.max_sessions
+
+    @classmethod
+    def from_value(cls, value: Any) -> "ReplicaConcurrencyConfig":
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError(f"replica_concurrency must be a mapping or ReplicaConcurrencyConfig, got {type(value)!r}")
+        return cls(**dict(value))
+
+
+@dataclass(frozen=True)
 class GlobalRequestRouterConfig:
     """Typed Hydra surface for Router policy."""
 
     dynamic_overload_admission: dict[str, Any] = field(default_factory=dict)
     # This policy is consumed by LLMServerClient, not by the Router actor.
     client_wait: RouterClientWaitConfig | dict[str, Any] = field(default_factory=RouterClientWaitConfig)
+    # Hard per-replica caps layered beneath framework-level total concurrency.
+    replica_concurrency: ReplicaConcurrencyConfig | dict[str, Any] = field(default_factory=ReplicaConcurrencyConfig)
     # Version a turn continues on after its request is aborted for a weight
     # update. ``same_version`` pins each session to its bound version;
     # ``latest_version`` rebinds before each request lease, so aborted turns
@@ -124,6 +173,7 @@ class GlobalRequestRouterConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "client_wait", RouterClientWaitConfig.from_value(self.client_wait))
+        object.__setattr__(self, "replica_concurrency", ReplicaConcurrencyConfig.from_value(self.replica_concurrency))
 
 
 @dataclass(frozen=True)
@@ -179,6 +229,7 @@ class GlobalRequestRouter:
             dynamic_overload_admission=router_config.dynamic_overload_admission,
             monotonic_fn=monotonic_fn,
         )
+        self._replica_concurrency = router_config.replica_concurrency
         self._planned_pause = False
 
     @property
@@ -198,6 +249,20 @@ class GlobalRequestRouter:
 
     def get_active_session_count(self) -> int:
         return len(self._sessions)
+
+    def get_replica_concurrency(self) -> dict[str, dict[str, Any]]:
+        """Return per-replica bound-session and in-flight request counts."""
+        route_counts = Counter(binding.server_id for binding in self._route_bindings())
+        inflight_counts = self._inflight_counts()
+        return {
+            server_id: {
+                "weight_version": state.weight_version,
+                "lifecycle": state.lifecycle,
+                "bound_sessions": route_counts[server_id],
+                "inflight_requests": inflight_counts[server_id],
+            }
+            for server_id, state in self._server_states.items()
+        }
 
     def _inflight_count(self, server_id: str) -> int:
         return sum(
@@ -224,8 +289,20 @@ class GlobalRequestRouter:
             return None
         return self._open_exact_route(session_id, minimum)
 
+    def try_bind_route(self, session_id: str, **kwargs: Any) -> int | None | RouteUnavailable:
+        """Bind or return a retryable wait without logging an actor exception."""
+        try:
+            return self.bind_route(session_id, **kwargs)
+        except RouteUnavailableError as error:
+            return RouteUnavailable(str(error), planned_pause=error.planned_pause)
+
     def _open_latest_route(self, session_id: str, minimum: int | None) -> None:
-        eligible_servers = self._latest_routable_servers(0 if minimum is None else minimum)
+        floor = 0 if minimum is None else minimum
+        eligible_servers = (
+            self._latest_routable_servers(floor)
+            if session_id in self._sessions
+            else self._admissible_latest_route_servers(floor)
+        )
         self._place_latest_route(session_id, eligible_servers=eligible_servers, open_session=True)
 
     def _open_exact_route(self, session_id: str, minimum: int | None) -> int | None:
@@ -269,7 +346,9 @@ class GlobalRequestRouter:
             return
 
         if eligible_servers is None:
-            eligible_servers = self._eligible_exact_route_servers()
+            eligible_servers = (
+                self._admissible_exact_route_servers() if open_session else self._eligible_exact_route_servers()
+            )
         matching_servers = [
             server_id
             for server_id, state in eligible_servers.items()
@@ -334,6 +413,13 @@ class GlobalRequestRouter:
 
     def _select_latest_route_server(self, base_eligible_servers: list[str]) -> str:
         eligible_servers, route_counts, inflight_counts = self._route_selection_inputs(base_eligible_servers)
+        inflight_limit = self._replica_concurrency.max_inflight_requests
+        if inflight_limit is not None:
+            under_inflight_cap = [
+                server_id for server_id in eligible_servers if inflight_counts[server_id] < inflight_limit
+            ]
+            if under_inflight_cap:
+                eligible_servers = under_inflight_cap
 
         def latest_route_score(server_id: str) -> tuple[int, float, int, int, str]:
             score = self._runtime.new_route_score(
@@ -381,6 +467,7 @@ class GlobalRequestRouter:
         minimum = _required_non_negative_int(weight_version, field_name="weight_version")
         if self._latest_version:
             eligible_servers = self._latest_routable_servers(minimum)
+            self._admissible_latest_route_servers(minimum)
             return min(state.weight_version for state in eligible_servers.values() if state.weight_version >= minimum)
         version, _ = self._exact_routable_cohort(minimum)
         return version
@@ -391,9 +478,38 @@ class GlobalRequestRouter:
             raise RouteUnavailableError(NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause)
         return eligible_servers
 
+    def _admissible_latest_route_servers(self, minimum_weight_version: int) -> dict[str, _ServerState]:
+        eligible_servers = self._latest_routable_servers(minimum_weight_version)
+        limit = self._replica_concurrency.max_sessions
+        if limit is None:
+            return eligible_servers
+        newest_version = max(state.weight_version for state in eligible_servers.values())
+        newest_ids = [
+            server_id for server_id, state in eligible_servers.items() if state.weight_version == newest_version
+        ]
+        # Unbound live sessions (fenced by an update or colocate pause) still own
+        # cohort capacity until they finish and release_route.
+        if len(self._sessions) >= len(newest_ids) * limit:
+            raise RouteUnavailableError(NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause)
+        route_counts = Counter(binding.server_id for binding in self._route_bindings())
+        admissible = {
+            server_id: eligible_servers[server_id] for server_id in newest_ids if route_counts[server_id] < limit
+        }
+        if not admissible:
+            raise RouteUnavailableError(NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause)
+        return admissible
+
+    def _admissible_exact_route_servers(self) -> dict[str, _ServerState]:
+        eligible_servers = self._eligible_exact_route_servers()
+        limit = self._replica_concurrency.max_sessions
+        if limit is None or not eligible_servers:
+            return eligible_servers
+        route_counts = Counter(binding.server_id for binding in self._route_bindings())
+        return {server_id: state for server_id, state in eligible_servers.items() if route_counts[server_id] < limit}
+
     def _exact_routable_cohort(self, minimum_weight_version: int) -> tuple[int, dict[str, _ServerState]]:
         """Return the lowest accepted version and the snapshot used to select it."""
-        eligible_servers = self._eligible_exact_route_servers()
+        eligible_servers = self._admissible_exact_route_servers()
         versions = [
             state.weight_version
             for state in eligible_servers.values()
@@ -427,9 +543,22 @@ class GlobalRequestRouter:
         else:
             binding = self._validate_exact_route(session, weight_version)
         server_id = binding.server_id
+        inflight_limit = self._replica_concurrency.max_inflight_requests
+        if inflight_limit is not None and self._inflight_count(server_id) >= inflight_limit:
+            raise RouteUnavailableError(
+                f"server {server_id!r} reached max_inflight_requests ({inflight_limit})",
+                planned_pause=self._planned_pause,
+            )
         # Leases retain the serving replica even if a later update moves or drops the route.
         session.leases[lease_id] = server_id
         return server_id, self._server_states[server_id].handle
+
+    def try_acquire_lease(self, session_id: str, **kwargs: Any) -> tuple[str, ray.actor.ActorHandle] | RouteUnavailable:
+        """Acquire or return a retryable wait without logging an actor exception."""
+        try:
+            return self.acquire_lease(session_id, **kwargs)
+        except RouteUnavailableError as error:
+            return RouteUnavailable(str(error), planned_pause=error.planned_pause)
 
     def release_lease(self, session_id: str, lease_id: str) -> None:
         """Idempotently release one committed request lease."""
@@ -668,6 +797,7 @@ class GlobalRequestRouter:
                 source_max_kv_cache_usage=source_max_kv_cache_usage,
                 destination_max_kv_cache_usage=destination_max_kv_cache_usage,
                 excluded_servers=excluded_servers,
+                destination_max_sessions=self._replica_concurrency.effective_repack_max_sessions,
             )
             if repack_enabled
             else []

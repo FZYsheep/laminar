@@ -34,7 +34,12 @@ from omegaconf import DictConfig
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
 
-from laminar.global_request_router.router import RouterClientWaitConfig, RouteUnavailableError
+from laminar.global_request_router.router import (
+    ReplicaConcurrencyConfig,
+    RouterClientWaitConfig,
+    RouteUnavailable,
+    RouteUnavailableError,
+)
 from laminar.multi_version_rollout.lifecycle import is_recoverable_backend_error
 from laminar.utils.concurrency import await_shielded_completion
 
@@ -104,6 +109,9 @@ class LLMServerClient:
         self._router = router
         router_config = getattr(config, "rollout_router", None)
         self._wait = RouterClientWaitConfig.from_value(getattr(router_config, "client_wait", None))
+        self._replica_concurrency = ReplicaConcurrencyConfig.from_value(
+            getattr(router_config, "replica_concurrency", None)
+        )
 
     @staticmethod
     async def _settle_rpc(awaitable, deadline: float | None = None):
@@ -160,15 +168,18 @@ class LLMServerClient:
                 raise TimeoutError("Router availability wait expired")
             try:
                 remote = getattr(self._router, method).remote(**kwargs)
-                return await self._settle_rpc(remote, deadline)
+                result = await self._settle_rpc(remote, deadline)
             except RouteUnavailableError as error:
-                if getattr(error, "planned_pause", False):
-                    deadline = pause_deadline
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("Router availability wait expired") from error
-                await asyncio.sleep(min(remaining, random.uniform(interval / 2, interval)))
-                interval = min(self._wait.max_backoff_s, interval * 2)
+                result = RouteUnavailable(str(error), planned_pause=error.planned_pause)
+            if not isinstance(result, RouteUnavailable):
+                return result
+            if result.planned_pause:
+                deadline = pause_deadline
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Router availability wait expired: {result.message}")
+            await asyncio.sleep(min(remaining, random.uniform(interval / 2, interval)))
+            interval = min(self._wait.max_backoff_s, interval * 2)
 
     async def _acquire_lease(
         self,
@@ -179,9 +190,14 @@ class LLMServerClient:
         planned_pause: bool,
         caller_deadline: float | None,
     ) -> tuple[str, Any]:
+        method = (
+            "try_acquire_lease"
+            if self._replica_concurrency.enabled and hasattr(self._router, "try_acquire_lease")
+            else "acquire_lease"
+        )
         try:
             return await self._retry_router_call(
-                "acquire_lease",
+                method,
                 dict(session_id=session_id, lease_id=lease_id, weight_version=weight_version),
                 planned_pause=planned_pause,
                 caller_deadline=caller_deadline,
@@ -220,8 +236,13 @@ class LLMServerClient:
         session_id = resolve_session_id(session_id, request_id=request_id)
         weight_version = _strict_optional_non_negative_int(weight_version, field_name="weight_version")
         caller_deadline = _caller_deadline(remaining_timeout_s)
+        method = (
+            "try_bind_route"
+            if self._replica_concurrency.enabled and hasattr(self._router, "try_bind_route")
+            else "bind_route"
+        )
         return self._retry_router_call(
-            "bind_route",
+            method,
             dict(session_id=session_id, min_weight_version=weight_version),
             planned_pause=planned_pause,
             caller_deadline=caller_deadline,

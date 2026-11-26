@@ -16,7 +16,9 @@
 from laminar.global_request_router.router import (
     GlobalRequestRouter,
     GlobalRequestRouterConfig,
+    ReplicaConcurrencyConfig,
     RouterClientWaitConfig,
+    RouteUnavailable,
     RouteUnavailableError,
     SessionRouteClosedError,
 )
@@ -24,6 +26,8 @@ from laminar.global_request_router.router import (
 __all__ = [
     "GlobalRequestRouter",
     "GlobalRequestRouterConfig",
+    "ReplicaConcurrencyConfig",
+    "RouteUnavailable",
     "RouteUnavailableError",
     "RouterClientWaitConfig",
     "SessionRouteClosedError",

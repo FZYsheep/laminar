@@ -78,7 +78,7 @@ class ValidationRequestRouter(GlobalRequestRouter):
             return super()._exact_routable_cohort(minimum_weight_version)
         if minimum_weight_version not in set(self._validation_targets.values()):
             raise ValueError(f"version {minimum_weight_version} is not assigned to a validation replica group")
-        eligible_servers = self._eligible_exact_route_servers()
+        eligible_servers = self._admissible_exact_route_servers()
         if not any(state.weight_version == minimum_weight_version for state in eligible_servers.values()):
             raise RouteUnavailableError(NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause)
         return minimum_weight_version, eligible_servers
