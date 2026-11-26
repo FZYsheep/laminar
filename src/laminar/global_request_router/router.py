@@ -429,8 +429,7 @@ class GlobalRequestRouter:
         newest_ids = [
             server_id for server_id, state in eligible_servers.items() if state.weight_version == newest_version
         ]
-        # Unbound live sessions (fenced by an update or colocate pause) still own
-        # cohort capacity until they finish and release_route.
+        # Updates/pauses clear session.route; count unbound live sessions so newcomers cannot overfill before rebind.
         if len(self._sessions) >= len(newest_ids) * limit:
             raise RouteUnavailableError(NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause)
         route_counts = Counter(binding.server_id for binding in self._route_bindings())
