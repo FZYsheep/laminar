@@ -53,7 +53,6 @@ exec bash "${SCRIPT_DIR}/train.sh" \
     ++actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.video=0 \
     ++actor_rollout_ref.rollout.custom.agent_framework.gateway_count=4 \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.max_concurrent_sessions=16 \
-    rollout_router.logical_kv.enabled=True \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=4 \
     trainer.total_training_steps=3 \

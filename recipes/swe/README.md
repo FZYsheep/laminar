@@ -102,9 +102,8 @@ uv run --locked --extra megatron --extra vllm --extra ucx --extra swe \
 ## Qwen3.5-4B
 
 [`train_qwen35_4b.sh`](train_qwen35_4b.sh) runs a three-step check on one node:
-four FSDP2 Actor/Ref GPUs and four TP1 vLLM replicas, with GRPO, KL loss and
-per-replica session admission. It requires the reference-policy and session-KV
-PRs until those changes merge.
+four FSDP2 Actor/Ref GPUs and four TP1 vLLM replicas, with GRPO and KL loss.
+It requires the reference-policy PR until that change merges.
 
 Use the same data, output and sandbox setup as above, with Qwen3.5-4B weights:
 
