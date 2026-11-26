@@ -76,7 +76,6 @@ def _plan_repack_groups(
     source_max_kv_cache_usage: float,
     destination_max_kv_cache_usage: float,
     excluded_servers: frozenset[str],
-    destination_max_sessions: int | None = None,
 ) -> list[CommittedRepackGroup]:
     """Plan same-version Best-Fit groups without mutating Router state."""
     version_groups: dict[int, list[tuple[_RepackServerView, float]]] = {}
@@ -98,7 +97,7 @@ def _plan_repack_groups(
     for version in sorted(version_groups):
         servers_in_version = version_groups[version]
         source_candidates = sorted(
-            (kv_cache_usage, server.server_id, server.route_count)
+            (kv_cache_usage, server.server_id)
             for server, kv_cache_usage in servers_in_version
             if server.route_count != 0 and kv_cache_usage <= source_max_kv_cache_usage
         )
@@ -107,8 +106,7 @@ def _plan_repack_groups(
 
         planned_sources: dict[str, list[str]] = {}
         planned_destination_kv = {server.server_id: kv_cache_usage for server, kv_cache_usage in servers_in_version}
-        planned_destination_routes = {server.server_id: server.route_count for server, _ in servers_in_version}
-        for source_kv_cache_usage, source_id, source_routes in source_candidates:
+        for source_kv_cache_usage, source_id in source_candidates:
             if source_id not in planned_destination_kv or source_id in planned_sources:
                 continue
             best_fit: tuple[float, str] | None = None
@@ -116,11 +114,6 @@ def _plan_repack_groups(
                 if destination_id == source_id:
                     continue
                 if destination_kv_cache_usage > destination_max_kv_cache_usage:
-                    continue
-                if (
-                    destination_max_sessions is not None
-                    and planned_destination_routes[destination_id] + source_routes > destination_max_sessions
-                ):
                     continue
                 projected_destination_kv_cache_usage = destination_kv_cache_usage + source_kv_cache_usage
                 if projected_destination_kv_cache_usage > destination_max_kv_cache_usage:
@@ -136,10 +129,8 @@ def _plan_repack_groups(
                 continue
             projected_destination_kv_cache_usage, destination_id = best_fit
             del planned_destination_kv[source_id]
-            del planned_destination_routes[source_id]
             planned_sources.setdefault(destination_id, []).append(source_id)
             planned_destination_kv[destination_id] = projected_destination_kv_cache_usage
-            planned_destination_routes[destination_id] += source_routes
 
         for destination_id in sorted(planned_sources):
             groups.append(

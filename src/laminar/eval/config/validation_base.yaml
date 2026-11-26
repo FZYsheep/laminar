@@ -56,8 +56,6 @@ rollout_router:
     kv_cache_usage_threshold: 0.80
   replica_concurrency:
     max_sessions: null
-    repack_max_sessions: null
-    max_inflight_requests: null
 
 timeout:
   init_model: 3600

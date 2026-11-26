@@ -104,13 +104,10 @@ rollout_router:
     mode: "off"  # off | enforce
     max_snapshot_age_s: 5.0
     kv_cache_usage_threshold: 0.80
-  # Hard per-replica caps enforced by GlobalRequestRouter beneath the framework
-  # runner's total max_concurrent_sessions semaphore. Null disables each cap;
-  # repack_max_sessions defaults to max_sessions when left null.
+  # Hard per-replica session admission cap beneath the framework runner's total
+  # max_concurrent_sessions semaphore. Null disables the cap.
   replica_concurrency:
     max_sessions: null
-    repack_max_sessions: null
-    max_inflight_requests: null
   # same_version | latest_version. A weight update aborts in-flight turns,
   # which keep their generated tokens and continue. same_version pins each
   # session to one weight version and uses Repack; latest_version keeps
