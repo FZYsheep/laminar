@@ -136,9 +136,113 @@ def _extract_actor_update_metrics(output: Any) -> dict[str, Any]:
     return actor_metrics
 
 
+_MEGATRON_PARALLEL_FIELDS = (
+    "tensor_model_parallel_size",
+    "pipeline_model_parallel_size",
+    "virtual_pipeline_model_parallel_size",
+    "context_parallel_size",
+    "dynamic_context_parallel",
+    "expert_model_parallel_size",
+    "expert_tensor_parallel_size",
+    "sequence_parallel",
+    "use_mbridge",
+)
+_REF_UNUSED_BATCH_KEYS = (
+    "routed_experts",
+    "old_log_probs",
+    "entropy",
+    "rollout_log_probs",
+    "behav_log_probs",
+    "rm_scores",
+    "advantages",
+    "returns",
+)
+
+
 def _rollout_correction_enabled(config: DictConfig) -> bool:
     rollout_corr_config = config.algorithm.rollout_correction
     return rollout_corr_config.rollout_is is not None or rollout_corr_config.rollout_rs is not None
+
+
+def _megatron_parallel_value(meg: Any, field_name: str) -> Any:
+    if field_name == "expert_tensor_parallel_size":
+        return meg.get("expert_tensor_parallel_size") or meg.get("tensor_model_parallel_size")
+    if field_name == "sequence_parallel":
+        return bool(meg.get("sequence_parallel", True)) and int(meg.get("tensor_model_parallel_size", 1)) > 1
+    return meg.get(field_name)
+
+
+def _check_megatron_token_cap(cap: Any, cp_size: int, max_seq_len: int, *, name: str) -> None:
+    total = -1 if cap is None else int(cap) * cp_size
+    if total < max_seq_len:
+        raise ValueError(
+            f"{name} * context_parallel_size must cover max_seq_len "
+            f"for Megatron dynamic batching: {total} < {max_seq_len}"
+        )
+
+
+def validate_actor_reference_config(config: DictConfig) -> None:
+    """Reject unsupported KL-in-reward/LoRA modes and mismatched colocated ref topology."""
+    if bool(config.algorithm.get("use_kl_in_reward", False)):
+        raise ValueError("async_rl does not support KL in reward; use actor.use_kl_loss")
+    model = config.actor_rollout_ref.get("model") or {}
+    lora_cfg = model.get("lora") or {}
+    if (
+        int(model.get("lora_rank", 0) or 0) > 0
+        or int(lora_cfg.get("rank", 0) or 0) > 0
+        or model.get("lora_adapter_path") is not None
+    ):
+        raise ValueError("async_rl does not support LoRA/PEFT configurations")
+
+    actor = config.actor_rollout_ref.actor
+    if not bool(actor.get("use_kl_loss", False)):
+        return
+    ref = config.actor_rollout_ref.get("ref")
+    if ref is None:
+        raise ValueError("actor.use_kl_loss=True requires actor_rollout_ref.ref")
+    actor_strategy = str(actor.get("strategy", "fsdp2"))
+    ref_strategy = str(ref.get("strategy", actor_strategy))
+    if ref_strategy != actor_strategy:
+        raise ValueError(f"colocated ref.strategy ({ref_strategy!r}) must match actor.strategy ({actor_strategy!r})")
+
+    ref_dynamic_bsz = bool(ref.get("log_prob_use_dynamic_bsz", False))
+    if not ref_dynamic_bsz:
+        mbs = ref.get("log_prob_micro_batch_size")
+        mbs_per_gpu = ref.get("log_prob_micro_batch_size_per_gpu")
+        if mbs is not None and mbs_per_gpu is not None:
+            raise ValueError(
+                "ref.log_prob_micro_batch_size and ref.log_prob_micro_batch_size_per_gpu are mutually exclusive"
+            )
+        if mbs is None and mbs_per_gpu is None:
+            raise ValueError("set ref.log_prob_micro_batch_size_per_gpu when ref.log_prob_use_dynamic_bsz=False")
+
+    if actor_strategy == "megatron":
+        actor_meg = actor.get("megatron")
+        ref_meg = ref.get("megatron")
+        if actor_meg is None or ref_meg is None:
+            raise ValueError("megatron reference policy requires actor.megatron and ref.megatron")
+        for field_name in _MEGATRON_PARALLEL_FIELDS:
+            if _megatron_parallel_value(ref_meg, field_name) != _megatron_parallel_value(actor_meg, field_name):
+                raise ValueError(
+                    f"colocated ref.megatron.{field_name} ({ref_meg.get(field_name)!r}) "
+                    f"must match actor.megatron.{field_name} ({actor_meg.get(field_name)!r})"
+                )
+        if ref_dynamic_bsz and (data_cfg := config.get("data")) is not None:
+            _check_megatron_token_cap(
+                ref.get("log_prob_max_token_len_per_gpu"),
+                int(ref_meg.context_parallel_size),
+                int(data_cfg.max_prompt_length) + int(data_cfg.max_response_length),
+                name="ref.log_prob_max_token_len_per_gpu",
+            )
+    else:
+        if int(ref.get("ulysses_sequence_parallel_size", 1)) != int(actor.get("ulysses_sequence_parallel_size", 1)):
+            raise ValueError("colocated ref.ulysses_sequence_parallel_size must match actor")
+        actor_fsdp_size = int((actor.get("fsdp_config") or {}).get("fsdp_size", -1))
+        ref_fsdp_size = int((ref.get("fsdp_config") or {}).get("fsdp_size", -1))
+        if ref_fsdp_size != actor_fsdp_size:
+            raise ValueError(
+                f"colocated ref.fsdp_config.fsdp_size ({ref_fsdp_size}) must match actor ({actor_fsdp_size})"
+            )
 
 
 def _extract_reward_group_metrics(batch: SampledBatch) -> dict[str, float]:
@@ -261,8 +365,7 @@ class AsyncRLTrainer:
         self.config = config
         if _rollout_correction_enabled(config) and not bool(config.actor_rollout_ref.rollout.calculate_log_probs):
             raise ValueError("decoupled rollout correction requires actor_rollout_ref.rollout.calculate_log_probs=True")
-        if bool(config.algorithm.use_kl_in_reward):
-            raise ValueError("async_rl does not support KL in reward; use actor.use_kl_loss")
+        validate_actor_reference_config(config)
         self.trainer_config = trainer_config
         self.resource_pool_manager = resource_pool_manager
         self.experience_buffer = experience_buffer
@@ -930,13 +1033,22 @@ class AsyncRLTrainer:
 
     # TODO(async_rl): add critic support.
 
-    def _compute_ref_log_prob(self, td: TensorDict) -> None:
+    def _compute_ref_log_prob(self, td: TensorDict, metrics: dict[str, Any]) -> None:
         infer_td = td.clone(recurse=False)
+        for key in _REF_UNUSED_BATCH_KEYS:
+            infer_td.pop(key, None)
         if not infer_td["input_ids"].is_nested:
             infer_td = left_right_2_no_padding(infer_td)
         tu.assign_non_tensor(infer_td, calculate_entropy=False, compute_loss=False)
+
+        ref_start = time.perf_counter()
         output = self.ref_wg.compute_ref_log_prob(infer_td)
-        td["ref_log_prob"] = no_padding_2_padding(tu.get(output, "log_probs"), infer_td).float()
+        metrics["timing/ref_log_prob"] = time.perf_counter() - ref_start
+
+        log_probs = tu.get(output, "log_probs")
+        if log_probs is None:
+            raise RuntimeError("ref_wg.compute_ref_log_prob did not return log_probs")
+        td["ref_log_prob"] = no_padding_2_padding(log_probs, infer_td).float()
 
     # TODO(async_rl): add critic update support.
 
@@ -1010,9 +1122,11 @@ class AsyncRLTrainer:
 
     def _compute_actor_update_inputs(self, td: TensorDict, metrics: dict) -> None:
         """Compute read-only actor inputs without blocking the driver event loop."""
+        if not td["input_ids"].is_nested:
+            td = left_right_2_no_padding(td)
         self._compute_old_log_probs(td, metrics)
         if self.use_reference_policy:
-            self._compute_ref_log_prob(td)
+            self._compute_ref_log_prob(td, metrics)
         self._apply_rollout_correction(td, metrics)
         restore_train_mode = bool(metrics.get("old_log_prob/recomputed", 0.0))
         metrics["old_log_prob/restore_train_mode"] = float(restore_train_mode)
@@ -1305,8 +1419,6 @@ class AsyncRLTrainer:
             await self._prepare_actor_update(td, metrics)
             prepare_actor_update_time_s = time.perf_counter() - prepare_actor_update_start
 
-            # TODO(async_rl): add ref-policy KL support. KL-in-reward needs
-            # the relevant ref log-probs before trainer-side advantage.
             # TODO(async_rl): add critic support.
 
             # 3. Synchronize with the previous publish immediately before the
