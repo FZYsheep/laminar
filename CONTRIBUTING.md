@@ -18,3 +18,8 @@ Report security issues privately as described in [SECURITY.md](SECURITY.md).
   uv lock
   ```
 - **Release hygiene:** Do not include private endpoints, credentials, personal paths, or internal logs.
+
+## Agent-Assisted Contributions
+
+Agent-assisted pull requests are welcome, and contributors remain responsible for every line they submit.
+Keep agent-assisted PRs in **Draft** until self-review converges and a final human-involved review pass is complete (see [AGENTS.md](AGENTS.md) for the full workflow, including cross-model review and model disclosure / privacy options).
