@@ -3,7 +3,7 @@
 
 """Validation-only exact-version routing."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any
 
 from ray.actor import ActorHandle
@@ -15,11 +15,12 @@ from laminar.global_request_router.router import (
     GlobalRequestRouter,
     GlobalRequestRouterConfig,
     RouteUnavailableError,
+    _required_fraction,
     _required_non_negative_int,
     _ServerState,
     _strict_optional_non_negative_int,
 )
-from laminar.multi_version_rollout.repack import RepackPlanResult, RepackPolicy
+from laminar.multi_version_rollout.repack import RepackPlanResult
 
 
 def validation_replica_groups(server_ids: list[str], weight_versions: list[int]) -> dict[int, list[str]]:
@@ -44,14 +45,8 @@ class ValidationRequestRouter(GlobalRequestRouter):
         servers: dict[str, ActorHandle],
         config: GlobalRequestRouterConfig | None = None,
         monotonic_fn: Callable[[], float] | None = None,
-        repack_policy: RepackPolicy | Mapping[str, Any] | None = None,
     ) -> None:
-        super().__init__(
-            servers=servers,
-            config=config,
-            monotonic_fn=monotonic_fn,
-            repack_policy=repack_policy,
-        )
+        super().__init__(servers=servers, config=config, monotonic_fn=monotonic_fn)
         self._validation_targets: dict[str, int] | None = None
 
     def _place_exact_route(
@@ -158,7 +153,13 @@ class ValidationRequestRouter(GlobalRequestRouter):
             and self._server_is_drained(server_id)
         )
 
-    def plan_validation_repack(self, server_ids: list[str]) -> RepackPlanResult:
+    def plan_validation_repack(
+        self,
+        server_ids: list[str],
+        *,
+        source_max_kv_cache_usage: Any = 0.5,
+        destination_max_kv_cache_usage: Any = 0.95,
+    ) -> RepackPlanResult:
         """Consolidate one live checkpoint with the existing Router planner.
 
         Idle completed groups remain available to the evaluation coordinator.
@@ -174,11 +175,19 @@ class ValidationRequestRouter(GlobalRequestRouter):
             for server_id in selected
         ):
             raise ValueError("validation repack requires one loaded checkpoint matching every selected target")
+        source_max_kv_cache_usage = _required_fraction(
+            source_max_kv_cache_usage, field_name="source_max_kv_cache_usage"
+        )
+        destination_max_kv_cache_usage = _required_fraction(
+            destination_max_kv_cache_usage, field_name="destination_max_kv_cache_usage"
+        )
         selected_set = set(selected)
         if len(selected) < 2 or not any(binding.server_id in selected_set for binding in self._route_bindings()):
             return RepackPlanResult(groups=(), idle_sources=())
         return super().plan_and_begin_repack(
             loadable_version=versions.pop() + 1,
+            source_max_kv_cache_usage=source_max_kv_cache_usage,
+            destination_max_kv_cache_usage=destination_max_kv_cache_usage,
             excluded_servers=set(self._server_states) - selected_set,
         )
 
@@ -208,6 +217,8 @@ class ValidationRequestRouter(GlobalRequestRouter):
         self,
         *,
         loadable_version: Any,
+        source_max_kv_cache_usage: Any = 0.5,
+        destination_max_kv_cache_usage: Any = 0.95,
         excluded_servers: list[str] | tuple[str, ...] | set[str] | frozenset[str] | None = None,
         repack_enabled: bool = True,
     ) -> RepackPlanResult:
@@ -221,6 +232,8 @@ class ValidationRequestRouter(GlobalRequestRouter):
                 )
         return super().plan_and_begin_repack(
             loadable_version=loadable_version,
+            source_max_kv_cache_usage=source_max_kv_cache_usage,
+            destination_max_kv_cache_usage=destination_max_kv_cache_usage,
             excluded_servers=combined_exclusions,
             repack_enabled=repack_enabled,
         )

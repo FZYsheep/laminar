@@ -28,16 +28,12 @@ from typing import Any
 
 import ray
 
-from laminar.global_request_router.runtime import _optional_non_negative_int, _RuntimeRouting
+from laminar.global_request_router.runtime import _optional_non_negative_int, _required_fraction, _RuntimeRouting
 from laminar.multi_version_rollout.repack import (
     CommittedAbortSource,
-    CommittedRepackGroup,
     RepackPlanResult,
-    RepackPolicy,
-    RepackReplica,
-    RepackSession,
-    _commit_repack_groups,
-    resolve_repack_policy,
+    _plan_repack_groups,
+    _RepackServerView,
 )
 
 NO_AVAILABLE_SERVER_ERROR = "No available servers in load balancer"
@@ -154,7 +150,6 @@ class _SessionState:
     session_id: str
     route: _RouteBinding | None = None
     leases: dict[str, str] = field(default_factory=dict)
-    context_tokens: int = 0
 
 
 class GlobalRequestRouter:
@@ -165,7 +160,6 @@ class GlobalRequestRouter:
         servers: dict[str, ray.actor.ActorHandle],
         config: GlobalRequestRouterConfig | None = None,
         monotonic_fn: Callable[[], float] | None = None,
-        repack_policy: RepackPolicy | Mapping[str, Any] | None = None,
     ):
         router_config = GlobalRequestRouterConfig() if config is None else config
         if not isinstance(router_config, GlobalRequestRouterConfig):
@@ -185,7 +179,6 @@ class GlobalRequestRouter:
             dynamic_overload_admission=router_config.dynamic_overload_admission,
             monotonic_fn=monotonic_fn,
         )
-        self._repack_policy = resolve_repack_policy(repack_policy)
         self._planned_pause = False
 
     @property
@@ -416,14 +409,11 @@ class GlobalRequestRouter:
         *,
         lease_id: str,
         weight_version: Any | None = None,
-        context_tokens: Any | None = None,
     ) -> tuple[str, ray.actor.ActorHandle]:
         """Atomically commit one idempotent request lease on a live session."""
         session = self._live_session(session_id)
         lease_id = _required_non_empty_str(lease_id, field_name="lease_id")
         weight_version = _strict_optional_non_negative_int(weight_version, field_name="weight_version")
-        if context_tokens is not None:
-            context_tokens = _required_non_negative_int(context_tokens, field_name="context_tokens")
         if self._latest_version and weight_version is not None:
             raise ValueError("latest_version continuation routes every turn to the newest version; got a pin")
         server_id = session.leases.get(lease_id)
@@ -437,27 +427,17 @@ class GlobalRequestRouter:
         else:
             binding = self._validate_exact_route(session, weight_version)
         server_id = binding.server_id
-        if context_tokens is not None:
-            session.context_tokens = context_tokens
         # Leases retain the serving replica even if a later update moves or drops the route.
         session.leases[lease_id] = server_id
         return server_id, self._server_states[server_id].handle
 
-    def release_lease(
-        self,
-        session_id: str,
-        lease_id: str,
-        *,
-        context_tokens: Any | None = None,
-    ) -> None:
+    def release_lease(self, session_id: str, lease_id: str) -> None:
         """Idempotently release one committed request lease."""
         session_id = _required_non_empty_str(session_id, field_name="session_id")
         lease_id = _required_non_empty_str(lease_id, field_name="lease_id")
-        if context_tokens is not None:
-            context_tokens = _required_non_negative_int(context_tokens, field_name="context_tokens")
         session = self._sessions.get(session_id)
-        if session is not None and session.leases.pop(lease_id, None) is not None and context_tokens is not None:
-            session.context_tokens = context_tokens
+        if session is not None:
+            session.leases.pop(lease_id, None)
 
     def release_route(
         self,
@@ -521,11 +501,21 @@ class GlobalRequestRouter:
         self,
         *,
         loadable_version: Any,
+        source_max_kv_cache_usage: Any = 0.5,
+        destination_max_kv_cache_usage: Any = 0.95,
         excluded_servers: list[str] | tuple[str, ...] | set[str] | frozenset[str] | None = None,
         repack_enabled: bool = True,
     ) -> RepackPlanResult:
         """Atomically plan and commit one Repack pass from the pushed runtime cache."""
         loadable_version = _required_non_negative_int(loadable_version, field_name="loadable_version")
+        source_max_kv_cache_usage = _required_fraction(
+            source_max_kv_cache_usage,
+            field_name="source_max_kv_cache_usage",
+        )
+        destination_max_kv_cache_usage = _required_fraction(
+            destination_max_kv_cache_usage,
+            field_name="destination_max_kv_cache_usage",
+        )
         if isinstance(excluded_servers, str | bytes):
             raise ValueError("excluded_servers must be a sequence of server ids")
         if not isinstance(repack_enabled, bool):
@@ -541,6 +531,8 @@ class GlobalRequestRouter:
             return self._begin_latest_version_updates(loadable_version=loadable_version, excluded_servers=excluded)
         return self._begin_exact_version_repack(
             loadable_version=loadable_version,
+            source_max_kv_cache_usage=source_max_kv_cache_usage,
+            destination_max_kv_cache_usage=destination_max_kv_cache_usage,
             excluded_servers=excluded,
             repack_enabled=repack_enabled,
         )
@@ -648,67 +640,40 @@ class GlobalRequestRouter:
                 f"server {server_id!r} version {actual_version!r} does not match expected {expected_version!r}"
             )
 
-    def _repack_cohorts(
-        self,
-        *,
-        loadable_version: int,
-        excluded_servers: frozenset[str],
-        inflight_counts: Counter[str],
-    ) -> dict[int, tuple[RepackReplica, ...]]:
-        sessions_by_server: dict[str, list[RepackSession]] = {}
-        for session in self._sessions.values():
-            if session.route is None:
-                continue
-            sessions_by_server.setdefault(session.route.server_id, []).append(
-                RepackSession(
-                    session_id=session.session_id,
-                    context_tokens=session.context_tokens,
-                    inflight_leases=len(session.leases),
-                )
-            )
-        by_version: dict[int, list[RepackReplica]] = {}
-        for server_id, state in self._server_states.items():
-            if server_id in excluded_servers:
-                continue
-            if not 0 <= state.weight_version < loadable_version:
-                continue
-            if state.lifecycle != ACTIVE:
-                continue
-            if not self._runtime.is_available(server_id):
-                raise ValueError(f"active stale server {server_id!r} is not runtime available for repack planning")
-            runtime_state = self._runtime.server_state(server_id)
-            by_version.setdefault(state.weight_version, []).append(
-                RepackReplica(
-                    server_id=server_id,
-                    weight_version=state.weight_version,
-                    kv_cache_usage=runtime_state.kv_cache_usage,
-                    waiting_requests=int(runtime_state.num_waiting_requests or 0),
-                    running_requests=int(runtime_state.num_running_requests or 0),
-                    inflight_leases=inflight_counts[server_id],
-                    sessions=tuple(sessions_by_server.get(server_id, ())),
-                )
-            )
-        return {version: tuple(by_version[version]) for version in sorted(by_version)}
-
     def _begin_exact_version_repack(
         self,
         *,
         loadable_version: int,
+        source_max_kv_cache_usage: float,
+        destination_max_kv_cache_usage: float,
         excluded_servers: frozenset[str],
         repack_enabled: bool,
     ) -> RepackPlanResult:
         # Classification shares one synchronous snapshot; route mutations happen below.
-        inflight_counts = self._inflight_counts()
-        route_counts: Counter[str] | None = None
-        groups: list[CommittedRepackGroup] = []
-        if repack_enabled:
-            for cohort in self._repack_cohorts(
+        route_counts = Counter(binding.server_id for binding in self._route_bindings()) if repack_enabled else None
+        groups = (
+            _plan_repack_groups(
+                (
+                    _RepackServerView(
+                        server_id=server_id,
+                        weight_version=state.weight_version,
+                        active=state.lifecycle == ACTIVE,
+                        runtime_available=self._runtime.is_available(server_id),
+                        kv_cache_usage=self._runtime.server_state(server_id).kv_cache_usage,
+                        route_count=route_counts[server_id],
+                    )
+                    for server_id, state in self._server_states.items()
+                ),
                 loadable_version=loadable_version,
+                source_max_kv_cache_usage=source_max_kv_cache_usage,
+                destination_max_kv_cache_usage=destination_max_kv_cache_usage,
                 excluded_servers=excluded_servers,
-                inflight_counts=inflight_counts,
-            ).values():
-                groups.extend(_commit_repack_groups(cohort, self._repack_policy.plan(cohort)))
+            )
+            if repack_enabled
+            else []
+        )
         participants = {server_id for group in groups for server_id in (group.destination, *group.sources)}
+        inflight_counts = self._inflight_counts()
         idle_sources: list[str] = []
         for server_id, state in self._server_states.items():
             if (

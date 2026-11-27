@@ -95,9 +95,8 @@ def test_validation_config_composes_real_verl_schema():
     assert config.rollout_router.client_wait.timeout_s == 600
     assert config.rollout_router.client_wait.planned_pause_timeout_s == 3600
     assert config.rollout_router.dynamic_overload_admission.mode == "off"
-    assert config.validation.repack.policy._target_ == "laminar.multi_version_rollout.BestFitRepackPolicy"
-    assert config.validation.repack.policy.source_max_kv_cache_usage == 0.5
-    assert config.validation.repack.policy.destination_max_kv_cache_usage == 0.95
+    assert config.validation.repack.source_max_kv_cache_usage == 0.5
+    assert config.validation.repack.destination_max_kv_cache_usage == 0.95
     assert config.validation.repack.schedule_interval_s == 5.0
 
 

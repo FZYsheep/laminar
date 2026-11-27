@@ -339,12 +339,13 @@ def _validate_config(config: DictConfig) -> Path:
     if type(interval) not in (int, float) or not math.isfinite(interval) or interval <= 0:
         raise ValueError("validation.efficiency_interval_s must be finite and positive")
     repack = OmegaConf.select(config, "validation.repack", default={})
+    for name, default in (("source_max_kv_cache_usage", 0.5), ("destination_max_kv_cache_usage", 0.95)):
+        value = repack.get(name, default)
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"validation.repack.{name} must be in [0, 1]")
     schedule_interval = repack.get("schedule_interval_s", 5.0)
     if type(schedule_interval) not in (int, float) or not math.isfinite(schedule_interval) or schedule_interval <= 0:
         raise ValueError("validation.repack.schedule_interval_s must be finite and positive")
-    from laminar.multi_version_rollout.repack import resolve_repack_policy
-
-    resolve_repack_policy(repack.get("policy"))
     watch_dir = OmegaConf.select(config, "validation.queue.watch_dir")
     if watch_dir is not None and not Path(str(watch_dir)).is_absolute():
         raise ValueError("validation.queue.watch_dir must be an absolute path")
@@ -1097,7 +1098,11 @@ def _run_checkpoints(
                 ):
                     for run in repack_candidates:
                         plan = _wait(
-                            runtime.rollout_router.plan_validation_repack.remote(server_ids=run.server_ids),
+                            runtime.rollout_router.plan_validation_repack.remote(
+                                server_ids=run.server_ids,
+                                source_max_kv_cache_usage=repack.get("source_max_kv_cache_usage", 0.5),
+                                destination_max_kv_cache_usage=repack.get("destination_max_kv_cache_usage", 0.95),
+                            ),
                             controls,
                             _remaining_stage_timeout(run, timeout),
                         )

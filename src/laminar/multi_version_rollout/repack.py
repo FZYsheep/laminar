@@ -11,20 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Same-version Repack policy protocol, state views, and default BFD planner.
+"""Pure same-version Repack planning for multi-version rollout.
 
-The Router owns replica eligibility, version grouping, invariant validation, and
-atomic route migration; a ``RepackPolicy`` only maps destinations to source
-server ids within one eligible same-version cohort.
+The Router applies this plan atomically because it owns route bindings.
 """
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from importlib import import_module
-from typing import Any, Protocol, runtime_checkable
-
-from omegaconf import OmegaConf
+from typing import Any, Iterable
 
 
 @dataclass(frozen=True)
@@ -54,42 +48,18 @@ class RepackPlanResult:
 
 
 @dataclass(frozen=True)
-class RepackSession:
-    """Read-only snapshot of one sticky session bound to a candidate replica.
-
-    ``context_tokens`` reflects the most recent request lease on this session
-    (``0`` before its first turn); ``inflight_leases > 0`` indicates an active
-    generation phase.
-    """
-
-    session_id: str
-    context_tokens: int = 0
-    inflight_leases: int = 0
-
-
-@dataclass(frozen=True)
-class RepackReplica:
-    """Read-only state of one active, runtime-available stale replica."""
+class _RepackServerView:
+    """Immutable Router state consumed by one Repack planning pass."""
 
     server_id: str
     weight_version: int
+    active: bool
+    runtime_available: bool
     kv_cache_usage: Any | None
-    waiting_requests: int = 0
-    running_requests: int = 0
-    inflight_leases: int = 0
-    sessions: tuple[RepackSession, ...] = ()
-
-
-@runtime_checkable
-class RepackPolicy(Protocol):
-    """Strategy interface mapping ``destination_id -> source_ids`` in one cohort."""
-
-    def plan(self, replicas: Sequence[RepackReplica]) -> Mapping[str, Sequence[str]]: ...
+    route_count: int
 
 
 def _valid_kv_cache_usage(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return None
     try:
         parsed = float(value)
     except (TypeError, ValueError):
@@ -99,63 +69,59 @@ def _valid_kv_cache_usage(value: Any) -> float | None:
     return parsed
 
 
-@dataclass(frozen=True)
-class BestFitRepackPolicy:
-    """Default same-version Best-Fit Decreasing Repack policy bounded by backend KV usage."""
+def _plan_repack_groups(
+    servers: Iterable[_RepackServerView],
+    *,
+    loadable_version: int,
+    source_max_kv_cache_usage: float,
+    destination_max_kv_cache_usage: float,
+    excluded_servers: frozenset[str],
+) -> list[CommittedRepackGroup]:
+    """Plan same-version Best-Fit Decreasing groups without mutating Router state."""
+    version_groups: dict[int, list[tuple[_RepackServerView, float]]] = {}
+    for server in servers:
+        if server.server_id in excluded_servers:
+            continue
+        if not 0 <= server.weight_version < loadable_version:
+            continue
+        if not server.active:
+            continue
+        if not server.runtime_available:
+            raise ValueError(f"active stale server {server.server_id!r} is not runtime available for repack planning")
+        kv_cache_usage = _valid_kv_cache_usage(server.kv_cache_usage)
+        if kv_cache_usage is None:
+            raise ValueError(f"server {server.server_id!r} has missing or invalid kv_cache_usage for repack planning")
+        version_groups.setdefault(server.weight_version, []).append((server, kv_cache_usage))
 
-    source_max_kv_cache_usage: float = 0.5
-    destination_max_kv_cache_usage: float = 0.95
-
-    def __post_init__(self) -> None:
-        for name, value in (
-            ("source_max_kv_cache_usage", self.source_max_kv_cache_usage),
-            ("destination_max_kv_cache_usage", self.destination_max_kv_cache_usage),
-        ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int | float)
-                or not math.isfinite(value)
-                or not 0.0 <= value <= 1.0
-            ):
-                raise ValueError(f"{name} must be in [0, 1], got {value!r}")
-            object.__setattr__(self, name, float(value))
-
-    def plan(self, replicas: Sequence[RepackReplica]) -> dict[str, tuple[str, ...]]:
-        validated_kv: dict[str, float] = {}
-        for replica in replicas:
-            usage = _valid_kv_cache_usage(replica.kv_cache_usage)
-            if usage is None:
-                raise ValueError(
-                    f"server {replica.server_id!r} has missing or invalid kv_cache_usage for repack planning"
-                )
-            validated_kv[replica.server_id] = usage
-
-        if len(replicas) < 2:
-            return {}
+    groups: list[CommittedRepackGroup] = []
+    for version in sorted(version_groups):
+        servers_in_version = version_groups[version]
         source_candidates = sorted(
             (
-                (validated_kv[replica.server_id], replica.server_id)
-                for replica in replicas
-                if replica.sessions and validated_kv[replica.server_id] <= self.source_max_kv_cache_usage
+                (kv_cache_usage, server.server_id)
+                for server, kv_cache_usage in servers_in_version
+                if server.route_count != 0 and kv_cache_usage <= source_max_kv_cache_usage
             ),
             key=lambda candidate: (-candidate[0], candidate[1]),
         )
-        if not source_candidates:
-            return {}
+        if not source_candidates or len(servers_in_version) < 2:
+            continue
 
         planned_sources: dict[str, list[str]] = {}
-        planned_destination_kv = dict(validated_kv)
-        for source_kv, source_id in source_candidates:
+        planned_destination_kv = {server.server_id: kv_cache_usage for server, kv_cache_usage in servers_in_version}
+        for source_kv_cache_usage, source_id in source_candidates:
             if source_id not in planned_destination_kv or source_id in planned_sources:
                 continue
             best_fit: tuple[float, str] | None = None
-            for destination_id, destination_kv in planned_destination_kv.items():
-                if destination_id == source_id or destination_kv > self.destination_max_kv_cache_usage:
+            for destination_id, destination_kv_cache_usage in planned_destination_kv.items():
+                if destination_id == source_id:
                     continue
-                projected_kv = destination_kv + source_kv
-                if projected_kv > self.destination_max_kv_cache_usage:
+                if destination_kv_cache_usage > destination_max_kv_cache_usage:
                     continue
-                candidate = (projected_kv, destination_id)
+                projected_destination_kv_cache_usage = destination_kv_cache_usage + source_kv_cache_usage
+                if projected_destination_kv_cache_usage > destination_max_kv_cache_usage:
+                    continue
+                candidate = (projected_destination_kv_cache_usage, destination_id)
                 if (
                     best_fit is None
                     or candidate[0] > best_fit[0]
@@ -164,73 +130,17 @@ class BestFitRepackPolicy:
                     best_fit = candidate
             if best_fit is None:
                 continue
-            projected_kv, destination_id = best_fit
+            projected_destination_kv_cache_usage, destination_id = best_fit
             del planned_destination_kv[source_id]
             planned_sources.setdefault(destination_id, []).append(source_id)
-            planned_destination_kv[destination_id] = projected_kv
+            planned_destination_kv[destination_id] = projected_destination_kv_cache_usage
 
-        return {dst: tuple(planned_sources[dst]) for dst in sorted(planned_sources)}
-
-
-def resolve_repack_policy(policy: Any) -> RepackPolicy:
-    """Resolve an optional ``RepackPolicy`` instance or ``_target_`` mapping."""
-    if OmegaConf.is_config(policy):
-        policy = OmegaConf.to_container(policy, resolve=True)
-    if policy is None:
-        return BestFitRepackPolicy()
-    if isinstance(policy, Mapping):
-        spec = dict(policy)
-        target = spec.pop("_target_", None)
-        if not isinstance(target, str) or "." not in target:
-            raise ValueError("repack policy mapping must specify a dotted '_target_' class or callable")
-        module_name, attr_name = target.rsplit(".", 1)
-        policy = getattr(import_module(module_name), attr_name)(**spec)
-    if not isinstance(policy, RepackPolicy):
-        raise TypeError(f"repack policy must implement plan(replicas), got {type(policy)!r}")
-    return policy
-
-
-def _commit_repack_groups(
-    replicas: Sequence[RepackReplica],
-    plan: Mapping[str, Sequence[str]],
-) -> list[CommittedRepackGroup]:
-    """Validate a ``destination -> sources`` plan before Router state mutation."""
-    if not isinstance(plan, Mapping):
-        raise TypeError(f"repack policy must return a destination -> sources mapping, got {type(plan)!r}")
-    if not plan:
-        return []
-    by_id = {replica.server_id: replica for replica in replicas}
-    version = replicas[0].weight_version
-    claimed_replicas: set[str] = set()
-    committed: list[CommittedRepackGroup] = []
-    for destination, raw_sources in plan.items():
-        if isinstance(raw_sources, str | bytes) or not isinstance(raw_sources, Iterable):
-            raise TypeError(f"repack sources for {destination!r} must be an iterable of server_ids")
-        sources = tuple(raw_sources)
-        if not sources:
-            raise ValueError(f"repack group for destination {destination!r} has empty sources")
-        if destination not in by_id:
-            raise ValueError(f"repack destination {destination!r} is not in the eligible version cohort")
-        if len(set(sources)) != len(sources):
-            raise ValueError(f"repack group for destination {destination!r} contains duplicate sources")
-        if destination in sources:
-            raise ValueError(f"repack replica {destination!r} cannot be both source and destination")
-        for source_id in sources:
-            source = by_id.get(source_id)
-            if source is None:
-                raise ValueError(f"repack source {source_id!r} is not in the eligible version cohort")
-            if not source.sessions:
-                raise ValueError(f"repack source {source_id!r} has no bound sessions to migrate")
-        group_members = {destination, *sources}
-        overlap = claimed_replicas & group_members
-        if overlap:
-            raise ValueError(f"repack groups overlap on replicas: {sorted(overlap)}")
-        claimed_replicas.update(group_members)
-        committed.append(
-            CommittedRepackGroup(
-                sources=sources,
-                destination=destination,
-                weight_version=version,
+        for destination_id in sorted(planned_sources):
+            groups.append(
+                CommittedRepackGroup(
+                    sources=tuple(planned_sources[destination_id]),
+                    destination=destination_id,
+                    weight_version=version,
+                )
             )
-        )
-    return committed
+    return groups

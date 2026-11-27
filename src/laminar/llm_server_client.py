@@ -178,17 +178,11 @@ class LLMServerClient:
         weight_version: int | None,
         planned_pause: bool,
         caller_deadline: float | None,
-        context_tokens: int,
     ) -> tuple[str, Any]:
         try:
             return await self._retry_router_call(
                 "acquire_lease",
-                dict(
-                    session_id=session_id,
-                    lease_id=lease_id,
-                    weight_version=weight_version,
-                    context_tokens=context_tokens,
-                ),
+                dict(session_id=session_id, lease_id=lease_id, weight_version=weight_version),
                 planned_pause=planned_pause,
                 caller_deadline=caller_deadline,
             )
@@ -200,18 +194,8 @@ class LLMServerClient:
                 raise cleanup_cancellation from error
             raise
 
-    async def _release_lease(
-        self,
-        session_id: str,
-        lease_id: str,
-        *,
-        context_tokens: int,
-    ) -> None:
-        acknowledgement = await self._router.release_lease.remote(
-            session_id=session_id,
-            lease_id=lease_id,
-            context_tokens=context_tokens,
-        )
+    async def _release_lease(self, session_id: str, lease_id: str) -> None:
+        acknowledgement = await self._router.release_lease.remote(session_id=session_id, lease_id=lease_id)
         if acknowledgement is not None:
             raise RuntimeError(f"invalid request-lease release acknowledgement: {acknowledgement!r}")
 
@@ -317,14 +301,12 @@ class LLMServerClient:
             # Every acquired request slot must be released before cancellation
             # can reach the Gateway owner.
             backend_request_id = uuid4().hex
-            request_prompt_ids = [*prompt_ids, *generated_ids] if generated_ids else prompt_ids
             server_id, server = await self._acquire_lease(
                 session_id,
                 lease_id=backend_request_id,
                 weight_version=weight_version,
                 planned_pause=planned_pause,
                 caller_deadline=caller_deadline,
-                context_tokens=len(request_prompt_ids),
             )
 
             output: TokenOutput | None = None
@@ -334,7 +316,7 @@ class LLMServerClient:
                     server.generate.remote(
                         request_id=backend_request_id,
                         session_id=session_id,
-                        prompt_ids=request_prompt_ids,
+                        prompt_ids=[*prompt_ids, *generated_ids] if generated_ids else prompt_ids,
                         sampling_params=request_sampling_params,
                         image_data=image_data,
                         video_data=video_data,
@@ -348,11 +330,8 @@ class LLMServerClient:
                     raise
                 backend_error = exc
             finally:
-                observed_tokens = (
-                    len(request_prompt_ids) + len(output.token_ids) if output is not None else len(request_prompt_ids)
-                )
                 _, release_cancellation = await await_shielded_completion(
-                    self._release_lease(session_id, backend_request_id, context_tokens=observed_tokens)
+                    self._release_lease(session_id, backend_request_id)
                 )
             if release_cancellation is not None:
                 if backend_error is not None:

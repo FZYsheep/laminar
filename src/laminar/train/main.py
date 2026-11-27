@@ -303,7 +303,6 @@ def _initialize_runtime(config: DictConfig) -> _AsyncRLRuntime:
         rollout_router: ActorHandle = ray.remote(GlobalRequestRouter).remote(
             servers=dict(zip(llm_server_controllers, server_handles, strict=True)),
             config=rollout_router_config,
-            repack_policy=multi_version_rollout_config.repack.policy,
         )
         ray.get(
             llm_server_state_tracker.connect.remote(  # type: ignore[attr-defined]
@@ -471,9 +470,6 @@ def resolve_train_config(config: DictConfig) -> DictConfig:
         isinstance(relay_num_cpus_cfg, bool) or not isinstance(relay_num_cpus_cfg, int) or relay_num_cpus_cfg < 1
     ):
         raise ValueError("relay.num_cpus must be a positive integer")
-    from laminar.multi_version_rollout.repack import resolve_repack_policy
-
-    resolve_repack_policy(OmegaConf.select(config, "multi_version_rollout.repack.policy"))
 
     # Apply Megatron engine/optimizer defaults and validate Megatron-Bridge requirement.
     if strategy == "megatron":
