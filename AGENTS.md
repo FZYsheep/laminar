@@ -4,7 +4,7 @@ Read and follow [CONTRIBUTING.md](CONTRIBUTING.md) for development, validation, 
 
 ## Before Handing Off or Opening a PR
 
-1. **Self-review until clean:** Iterate `review -> fix -> re-review` on the full `git diff` (checking correctness, edge cases, concurrency/fault-tolerance assumptions, test coverage, and release hygiene) until no actionable issues remain.
+1. **Self-review until clean:** Iterate `review -> fix -> re-review` on all proposed changes against the target base branch (e.g., `git diff <base>...HEAD`, plus any staged/unstaged changes), checking correctness, edge cases, concurrency/fault-tolerance assumptions, test coverage, and release hygiene until no actionable issues remain.
    - Agent self-review is optional if the human contributor reviews the changes directly.
    - When running agent self-review, strongly prefer different model(s) (ideally from a different model family/provider) than the authoring model(s).
 2. **Re-validate after the final fix:** Re-run relevant validation commands from [CONTRIBUTING.md](CONTRIBUTING.md).
