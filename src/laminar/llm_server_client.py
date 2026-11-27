@@ -162,13 +162,15 @@ class LLMServerClient:
                 remote = getattr(self._router, method).remote(**kwargs)
                 return await self._settle_rpc(remote, deadline)
             except RouteUnavailableError as error:
-                if getattr(error, "planned_pause", False):
+                is_pause = bool(getattr(error, "planned_pause", False))
+                if is_pause:
                     saw_pause = True
                 if getattr(error, "capacity_full", False):
                     remaining_hard = hard_deadline - time.monotonic()
                     if remaining_hard <= 0:
                         raise TimeoutError("Router availability wait expired") from error
                     await asyncio.sleep(min(remaining_hard, random.uniform(interval / 2, interval)))
+                    saw_pause = is_pause
                     readiness_started = time.monotonic()
                 else:
                     window = self._wait.planned_pause_timeout_s if saw_pause else self._wait.timeout_s

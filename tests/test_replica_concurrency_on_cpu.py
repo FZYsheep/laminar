@@ -164,7 +164,7 @@ async def test_capacity_wait_decouples_from_readiness_timeouts(monkeypatch) -> N
     cfg = GlobalRequestRouterConfig(
         client_wait={
             "timeout_s": 0.015,
-            "planned_pause_timeout_s": 0.015,
+            "planned_pause_timeout_s": 5.0,
             "initial_backoff_s": 0.005,
             "max_backoff_s": 0.005,
         },
@@ -179,12 +179,26 @@ async def test_capacity_wait_decouples_from_readiness_timeouts(monkeypatch) -> N
     router.release_route("holder", weight_version=1)
     assert await asyncio.wait_for(waiter, timeout=1.0) == 1
 
-    # Control-plane unavailability (capacity_full=False) still expires promptly on timeout_s.
-    with pytest.raises(TimeoutError, match="Router availability wait expired"):
-        await client.bind_route("missing-version", weight_version=99)
+    # Post-pause capacity_full resets the 5.0s pause grace back to normal 0.015s timeout_s on a subsequent failure.
+    seq = iter(
+        [
+            RouteUnavailableError("paused", planned_pause=True),
+            RouteUnavailableError("resumed-full", capacity_full=True),
+        ]
+    )
 
-    # RolloutDispatcher likewise waits past _VERSION_WAIT_TIMEOUT_S on capacity_full=True, but fails fast on False.
+    async def remote_seq(**_kwargs):
+        raise next(seq, RouteUnavailableError("dead", capacity_full=False))
+
+    seq_client = LLMServerClient(
+        SimpleNamespace(rollout_router=cfg), SimpleNamespace(bind_route=SimpleNamespace(remote=remote_seq))
+    )
+    with pytest.raises(TimeoutError, match="Router availability wait expired"):
+        await asyncio.wait_for(seq_client.bind_route("after-pause", weight_version=1), timeout=0.3)
+
+    # RolloutDispatcher likewise waits past _VERSION_WAIT_TIMEOUT_S on capacity_full=True and resets pause grace.
     monkeypatch.setattr(dispatcher_module, "_VERSION_WAIT_TIMEOUT_S", 0.015)
+    monkeypatch.setattr(dispatcher_module, "_PLANNED_PAUSE_WAIT_TIMEOUT_S", 5.0)
     monkeypatch.setattr(dispatcher_module, "_VERSION_POLL_INTERVAL_S", 0.005)
     dispatcher = object.__new__(RolloutDispatcher)
     dispatcher.relay_client = SimpleNamespace(get_trainer_version=AsyncMock(return_value=1))
@@ -202,10 +216,18 @@ async def test_capacity_wait_decouples_from_readiness_timeouts(monkeypatch) -> N
     slot_open = True
     assert await asyncio.wait_for(disp_task, timeout=1.0) == (1, 1)
 
+    disp_seq = iter(
+        [
+            RouteUnavailableError("paused", planned_pause=True),
+            RouteUnavailableError("resumed-full", capacity_full=True),
+        ]
+    )
     dispatcher.rollout_router = SimpleNamespace(
         get_routable_version=SimpleNamespace(
-            remote=AsyncMock(side_effect=RouteUnavailableError("dead", capacity_full=False))
+            remote=AsyncMock(
+                side_effect=lambda **_kw: (_ for _ in ()).throw(next(disp_seq, RouteUnavailableError("dead")))
+            )
         )
     )
     with pytest.raises(TimeoutError):
-        await dispatcher._wait_for_available_version()
+        await asyncio.wait_for(dispatcher._wait_for_available_version(), timeout=0.3)
