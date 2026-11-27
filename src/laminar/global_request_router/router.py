@@ -48,9 +48,10 @@ LATEST_VERSION = "latest_version"
 class RouteUnavailableError(RuntimeError):
     """A valid routing operation cannot commit against the current replica state."""
 
-    def __init__(self, message: str, *, planned_pause: bool = False) -> None:
+    def __init__(self, message: str, *, planned_pause: bool = False, capacity_full: bool = False) -> None:
         super().__init__(message)
         self.planned_pause = planned_pause
+        self.capacity_full = capacity_full
 
 
 class SessionRouteClosedError(RuntimeError):
@@ -295,9 +296,17 @@ class GlobalRequestRouter:
             return
 
         if eligible_servers is None:
-            eligible_servers = (
-                self._admissible_exact_route_servers() if open_session else self._eligible_exact_route_servers()
-            )
+            if open_session:
+                base_servers = self._eligible_exact_route_servers()
+                if not base_servers:
+                    raise RouteUnavailableError(NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause)
+                eligible_servers = self._admissible_exact_route_servers(base_servers)
+                if not eligible_servers:
+                    raise RouteUnavailableError(
+                        NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause, capacity_full=True
+                    )
+            else:
+                eligible_servers = self._eligible_exact_route_servers()
         matching_servers = [
             server_id
             for server_id, state in eligible_servers.items()
@@ -350,13 +359,17 @@ class GlobalRequestRouter:
 
     def _select_exact_route_server(self, base_eligible_servers: list[str]) -> str:
         eligible_servers, route_counts, inflight_counts = self._route_selection_inputs(base_eligible_servers)
+        limit = self._max_sessions_per_replica
 
-        def exact_route_score(server_id: str) -> tuple[float, int, int, int, str]:
-            return self._runtime.new_route_score(
+        def exact_route_score(server_id: str) -> tuple[float, int, float, int, int, str]:
+            kv, routes, waiting, pressure, sid = self._runtime.new_route_score(
                 server_id,
                 route_count=route_counts[server_id],
                 inflight_request_count=inflight_counts[server_id],
             )
+            # Combine live slot occupancy with stale KV snapshots so bursts spread evenly.
+            load = max(kv, routes / limit) if limit is not None else kv
+            return (load, routes, kv, waiting, pressure, sid)
 
         return min(eligible_servers, key=exact_route_score)
 
@@ -391,16 +404,26 @@ class GlobalRequestRouter:
             server_id for server_id, state in eligible_servers.items() if state.weight_version == newest_version
         ]
         session = self._sessions.get(session_id)
+        if session is None and not open_session:
+            raise SessionRouteClosedError(f"session {session_id!r} is not bound")
         binding = session.route if session is not None else None
         if binding is not None and binding.server_id in newest_servers:
             server_id = binding.server_id
             if binding.weight_version == newest_version:
                 return
         else:
-            server_id = self._select_latest_route_server(newest_servers)
+            candidate_servers = newest_servers
+            if self._max_sessions_per_replica is not None:
+                route_counts = Counter(route.server_id for route in self._route_bindings())
+                candidate_servers = [
+                    sid for sid in newest_servers if route_counts[sid] < self._max_sessions_per_replica
+                ]
+                if not candidate_servers:
+                    raise RouteUnavailableError(
+                        NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause, capacity_full=True
+                    )
+            server_id = self._select_latest_route_server(candidate_servers)
         if session is None:
-            if not open_session:
-                raise SessionRouteClosedError(f"session {session_id!r} is not bound")
             session = self._sessions.setdefault(session_id, _SessionState(session_id))
         session.route = _RouteBinding(server_id=server_id, weight_version=newest_version)
 
@@ -409,7 +432,7 @@ class GlobalRequestRouter:
         minimum = _required_non_negative_int(weight_version, field_name="weight_version")
         if self._latest_version:
             eligible_servers = self._latest_routable_servers(minimum)
-            self._admissible_latest_route_servers(minimum)
+            self._admissible_latest_route_servers(minimum, eligible_servers=eligible_servers)
             return min(state.weight_version for state in eligible_servers.values() if state.weight_version >= minimum)
         version, _ = self._exact_routable_cohort(minimum)
         return version
@@ -420,8 +443,14 @@ class GlobalRequestRouter:
             raise RouteUnavailableError(NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause)
         return eligible_servers
 
-    def _admissible_latest_route_servers(self, minimum_weight_version: int) -> dict[str, _ServerState]:
-        eligible_servers = self._latest_routable_servers(minimum_weight_version)
+    def _admissible_latest_route_servers(
+        self,
+        minimum_weight_version: int,
+        *,
+        eligible_servers: dict[str, _ServerState] | None = None,
+    ) -> dict[str, _ServerState]:
+        if eligible_servers is None:
+            eligible_servers = self._latest_routable_servers(minimum_weight_version)
         limit = self._max_sessions_per_replica
         if limit is None:
             return eligible_servers
@@ -431,17 +460,24 @@ class GlobalRequestRouter:
         ]
         # Updates/pauses clear session.route; count unbound live sessions so newcomers cannot overfill before rebind.
         if len(self._sessions) >= len(newest_ids) * limit:
-            raise RouteUnavailableError(NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause)
+            raise RouteUnavailableError(
+                NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause, capacity_full=True
+            )
         route_counts = Counter(binding.server_id for binding in self._route_bindings())
         admissible = {
             server_id: eligible_servers[server_id] for server_id in newest_ids if route_counts[server_id] < limit
         }
         if not admissible:
-            raise RouteUnavailableError(NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause)
+            raise RouteUnavailableError(
+                NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause, capacity_full=True
+            )
         return admissible
 
-    def _admissible_exact_route_servers(self) -> dict[str, _ServerState]:
-        eligible_servers = self._eligible_exact_route_servers()
+    def _admissible_exact_route_servers(
+        self, eligible_servers: dict[str, _ServerState] | None = None
+    ) -> dict[str, _ServerState]:
+        if eligible_servers is None:
+            eligible_servers = self._eligible_exact_route_servers()
         limit = self._max_sessions_per_replica
         if limit is None or not eligible_servers:
             return eligible_servers
@@ -450,14 +486,19 @@ class GlobalRequestRouter:
 
     def _exact_routable_cohort(self, minimum_weight_version: int) -> tuple[int, dict[str, _ServerState]]:
         """Return the lowest accepted version and the snapshot used to select it."""
-        eligible_servers = self._admissible_exact_route_servers()
+        base_servers = self._eligible_exact_route_servers()
+        if not any(state.weight_version >= minimum_weight_version for state in base_servers.values()):
+            raise RouteUnavailableError(NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause)
+        eligible_servers = self._admissible_exact_route_servers(base_servers)
         versions = [
             state.weight_version
             for state in eligible_servers.values()
             if state.weight_version >= minimum_weight_version
         ]
         if not versions:
-            raise RouteUnavailableError(NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause)
+            raise RouteUnavailableError(
+                NO_AVAILABLE_SERVER_ERROR, planned_pause=self._planned_pause, capacity_full=True
+            )
         return min(versions), eligible_servers
 
     def acquire_lease(
